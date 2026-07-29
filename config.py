@@ -285,6 +285,32 @@ APPLE_PICKUP_STORE_LABELS = {
 # just pushes the next one out further — it never overlaps itself and
 # never affects any other loop's own cadence.
 APPLE_PICKUP_CHECK_INTERVAL = int(os.getenv("APPLE_PICKUP_CHECK_INTERVAL", "180"))  # 3 min default
+# NOTE (2026-07-29): as of worker.apple_pickup_stagger_loop, this interval
+# ONLY governs run_apple_official_pickup_cycle now (unaffected by the
+# change below — it hits a completely different Apple endpoint, cookie-
+# based fulfillment-messages via check_pickup_at_official_stores, not
+# playwright_scraper, so it was never part of the Playwright resource-
+# contention problem APPLE_PICKUP_STAGGER_INTERVAL_SECONDS addresses).
+
+# Personal /trackpickup rows and channel-forward pickup rows used to be
+# bulk-checked every APPLE_PICKUP_CHECK_INTERVAL with up to 10 rows
+# concurrent (asyncio.Semaphore(10)) — but each row concurrently checking
+# its own pincodes against playwright_scraper's Playwright fallback could
+# exceed that service's own MAX_CONCURRENT_CHECKS=2 browser-slot ceiling,
+# producing more "check failed" results under load than with fewer items
+# tracked (the same resource-contention pattern documented in playwright_
+# scraper/main.py's own MAX_CONCURRENT_CHECKS history: raised 2->4, hit
+# real browser-launch failures under concurrent load, reverted). Rather
+# than bulk-checking everything every cycle, worker.apple_pickup_stagger_
+# loop now cycles through every (product, pincode) combo ONE AT A TIME —
+# combined with checkers.apple's _playwright_fallback_lock (a global,
+# cross-caller lock ensuring at most one Playwright-backed check ever
+# runs system-wide, which /mypickups and /checkforwarding also respect),
+# this trades per-item refresh frequency for eliminating concurrent
+# browser-launch contention entirely. This is the delay BETWEEN each
+# individual combo's check — total time to cycle back to the same combo
+# is roughly (this value) x (total tracked combo count).
+APPLE_PICKUP_STAGGER_INTERVAL_SECONDS = int(os.getenv("APPLE_PICKUP_STAGGER_INTERVAL_SECONDS", "60"))
 
 # Croma's own dedicated check interval — same "isolate one site onto its own
 # cadence" pattern as APPLE_PICKUP_CHECK_INTERVAL above (a next_croma_run
