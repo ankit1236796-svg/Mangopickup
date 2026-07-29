@@ -632,10 +632,20 @@ def _evaluate_pickup_availability(data: dict, sku: str) -> bool | None:
 # way). First proven live via /debugpickupmessage (a genuine 200 OK with
 # real pickupDisplay/storesCount data), then stress-tested for reliability
 # via /debugpickupmessagestress (8/8 200s, byte-identical body, ~0.27s
-# average — vs. 30-90+s for the Playwright approach). Response shape
-# matches fulfillment-messages exactly (body.content.pickupMessage.stores),
-# so _parse_pickup_message_response below reuses the same field names
-# _evaluate_pickup_availability/available_stores_for_pickup already know.
+# average — vs. 30-90+s for the Playwright approach).
+#
+# 2026-07-29: response shape is body.stores[] DIRECTLY — {"head": {...},
+# "body": {"stores": [...], "storesCount": "...", "location": "...", ...}}
+# — NOT nested under body.content.pickupMessage like the OLD
+# fulfillment-messages endpoint _evaluate_pickup_availability/
+# check_pickup_at_official_stores parse. Originally assumed to match that
+# shape exactly (untested at the time), which meant direct_http_attempted
+# always came back True but failed with "no body.content.pickupMessage",
+# silently forcing every check onto the 30-90s Playwright fallback.
+# Confirmed via raw /debugpickupmessage response captures. Each store
+# dict's OWN fields (storeName, partsAvailability keyed by SKU,
+# pickupDisplay) are unchanged from the original assumption — only the
+# top-level path to `stores` was wrong.
 #
 # This is now tried FIRST by _fetch_pickup_availability_via_page_render
 # below, with the existing Playwright/Xvfb approach kept as an AUTOMATIC
@@ -658,11 +668,17 @@ _PICKUP_MESSAGE_TIMEOUT = 15.0
 def _parse_pickup_message_response(data: dict, sku: str) -> tuple[bool | None, list[dict], str | None, dict]:
     """
     Parses a /shop/retail/pickup-message response body — confirmed
-    (2026-07-28, live test) to share fulfillment-messages' exact shape:
-    body.content.pickupMessage.stores, each store carrying
-    partsAvailability keyed by SKU. Mirrors playwright_scraper's own
-    _parse_pickup_stores three-way True/False/None semantics exactly, so
-    both paths behave identically from every caller's point of view:
+    (2026-07-29, live raw-response captures via /debugpickupmessage) to be
+    shaped {"head": {...}, "body": {"stores": [...], "storesCount": "...",
+    "location": "...", ...}}: `stores` sits DIRECTLY under `body`, not
+    nested under a `content.pickupMessage` wrapper like the OLD
+    fulfillment-messages endpoint. Each store dict's own fields
+    (storeName, partsAvailability keyed by SKU, pickupDisplay) match what
+    _evaluate_pickup_availability/available_stores_for_pickup already
+    know, so only the top-level lookup differs. Mirrors playwright_
+    scraper's own _parse_pickup_stores three-way True/False/None
+    semantics exactly, so both paths behave identically from every
+    caller's point of view:
       - True: at least one store shows this SKU as available/eligible for
         pickup — a genuine, pincode-specific confirmation.
       - False: real stores were returned and the SKU WAS found in at
@@ -673,26 +689,23 @@ def _parse_pickup_message_response(data: dict, sku: str) -> tuple[bool | None, l
         confirmed negative (same "sparse Indian store network" reasoning
         this module uses everywhere else).
 
-    error is set ONLY when the response is missing body/content/
-    pickupMessage entirely (a genuinely unexpected shape) — NOT on the
-    ordinary "zero stores"/"sku not found" cases above, which are valid,
-    fully-parsed signals. This distinction is what
+    error is set ONLY when the response is missing body/body.stores
+    entirely (a genuinely unexpected shape) — NOT on the ordinary "zero
+    stores"/"sku not found" cases above, which are valid, fully-parsed
+    signals. This distinction is what
     _fetch_pickup_availability_via_page_render's fallback decision is
     built on: error triggers a fallback to Playwright, a legitimate None
     does not (it means exactly what Playwright's own None already means
     to every caller).
     """
-    try:
-        pickup_message = (data.get("body") or {}).get("content", {}).get("pickupMessage")
-    except AttributeError:
-        pickup_message = None
-    if not isinstance(pickup_message, dict):
-        return None, [], "unexpected response shape — no body.content.pickupMessage", {
+    body = data.get("body")
+    if not isinstance(body, dict):
+        return None, [], "unexpected response shape — no body", {
             "store_count": 0, "sku_found": False, "sku_keys_seen": [],
         }
-    stores = pickup_message.get("stores")
+    stores = body.get("stores")
     if stores is None:
-        return None, [], "unexpected response shape — no body.content.pickupMessage.stores", {
+        return None, [], "unexpected response shape — no body.stores", {
             "store_count": 0, "sku_found": False, "sku_keys_seen": [],
         }
 
