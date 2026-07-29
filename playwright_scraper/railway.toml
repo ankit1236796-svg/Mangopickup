@@ -1,0 +1,12 @@
+[build]
+builder = "dockerfile"
+
+# No [deploy].startCommand override (2026-07-28, removed): this used to
+# hardcode "python main.py" here, silently overriding the Dockerfile's
+# own CMD — Docker's CMD ["./start.sh"] was added later (to start Xvfb
+# before python main.py) but this file was never updated to match, so
+# Railway kept running the stale command with no error, no warning, and
+# no [start.sh] log output at all. builder = "dockerfile" above means
+# the Dockerfile is meant to own runtime behavior; removing this override
+# restores that as the single source of truth instead of two configs
+# that can silently drift out of sync again.
