@@ -16,7 +16,6 @@ plan/trial/item-limit system, bulk-add, etc. Only what's needed here:
   worker.run_apple_official_pickup_cycle actually needs.
 """
 
-import asyncio
 import html
 import logging
 from urllib.parse import urlparse
@@ -219,20 +218,25 @@ async def cmd_mypickups(message: Message):
             t("mypickups_checking", lang, count=len(rows)), parse_mode="HTML"
         )
 
-        sem = asyncio.Semaphore(10)
-
-        async def _check_one(row: dict) -> tuple[dict, dict]:
-            async with sem:
-                try:
-                    results = await apple_checker.check_pickup_row(message.bot, row)
-                except Exception as exc:
-                    logger.error(
-                        f"[mypickups] check failed for tracking #{row['id']}: {exc}", exc_info=True
-                    )
-                    results = {}
-                return row, results
-
-        rows_with_results = list(await asyncio.gather(*[_check_one(row) for row in rows]))
+        # Sequential, not concurrent (2026-07-29) — concurrent row checks
+        # here could exceed playwright_scraper's own MAX_CONCURRENT_
+        # CHECKS=2 browser-slot ceiling, producing more "check failed"
+        # results under load than with fewer items tracked. checkers.
+        # apple's _playwright_fallback_lock (shared with the background
+        # stagger loop) already guarantees at most one Playwright-backed
+        # check runs system-wide at a time; going sequential here too
+        # avoids piling up requests behind that lock for no benefit,
+        # since this command's own rows would just serialize on it anyway.
+        rows_with_results: list[tuple[dict, dict]] = []
+        for row in rows:
+            try:
+                results = await apple_checker.check_pickup_row(message.bot, row)
+            except Exception as exc:
+                logger.error(
+                    f"[mypickups] check failed for tracking #{row['id']}: {exc}", exc_info=True
+                )
+                results = {}
+            rows_with_results.append((row, results))
 
         await progress.edit_text(
             _format_mypickups_results(rows_with_results, lang), parse_mode="HTML"

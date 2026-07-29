@@ -1073,6 +1073,16 @@ async def cmd_checkforwarding(message: Message):
 
     await message.answer(f"🔍 Checking {len(pickup_rows)} pickup item(s) now…")
 
+    # Sequential, not concurrent (2026-07-29, reverted from the earlier
+    # asyncio.gather + Semaphore(10) pattern) — concurrent row checks here
+    # could exceed playwright_scraper's own MAX_CONCURRENT_CHECKS=2
+    # browser-slot ceiling, producing more "check failed" results under
+    # load than with fewer items forwarded. checkers.apple's
+    # _playwright_fallback_lock (shared with the background stagger loop
+    # and /mypickups) already guarantees at most one Playwright-backed
+    # check runs system-wide at a time; going sequential here too avoids
+    # piling up requests behind that lock for no benefit, since this
+    # command's own rows would just serialize on it anyway.
     lines: list[str] = []
     for row in pickup_rows:
         try:

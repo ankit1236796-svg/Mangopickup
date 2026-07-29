@@ -3,10 +3,13 @@ worker.py
 ~~~~~~~~~
 Apple pickup-checking bot — extracted from Tracker-alert's bot.py, which
 also runs regular stock-checking, access/trial maintenance, WhatsApp
-forwarding, etc. Only the Apple-pickup-related loops are here:
-apple_pickup_check_loop (which itself runs run_pickup_check_cycle,
-run_apple_official_pickup_cycle, and run_channel_forward_pickup_check_cycle)
-and apple_cookie_refresh_loop.
+forwarding, etc. Loops here: apple_pickup_check_loop (now ONLY
+run_apple_official_pickup_cycle, on its own cadence — a separate,
+cookie-based Apple endpoint, not playwright_scraper), apple_pickup_
+stagger_loop (personal /trackpickup + channel-forward pickup rows, one
+(product, pincode) combo at a time — see that loop's own docstring for
+why this replaced the old bulk-concurrent run_pickup_check_cycle /
+run_channel_forward_pickup_check_cycle), and apple_cookie_refresh_loop.
 
 Also registers apple_admin_handlers.router so the /debugpickup* diagnostic
 commands work — this is a fully independent bot/token/DB, so there's no
@@ -29,7 +32,8 @@ from apple_admin_handlers import router as admin_router
 from pickup_handlers import router as pickup_router
 from config import (
     BOT_TOKEN, APPLE_PICKUP_PINCODES, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED,
-    APPLE_PICKUP_CHECK_INTERVAL, PLAYWRIGHT_SCRAPER_URL, PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN,
+    APPLE_PICKUP_CHECK_INTERVAL, APPLE_PICKUP_STAGGER_INTERVAL_SECONDS,
+    PLAYWRIGHT_SCRAPER_URL, PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN,
     APPLE_COOKIE_REFRESH_INTERVAL, APPLE_COOKIE_REFRESH_PRODUCT_URL, APPLE_COOKIE_REFRESH_PINCODE,
     APPLE_COOKIE_REFRESH_MAX_ATTEMPTS, APPLE_COOKIE_REFRESH_RETRY_DELAY_MIN_SECONDS,
     APPLE_COOKIE_REFRESH_RETRY_DELAY_MAX_SECONDS,
@@ -54,48 +58,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# /trackpickup rows (database.pickup_tracking)
-# ---------------------------------------------------------------------------
-
-async def _check_pickup_row(bot: Bot, row: dict) -> dict:
-    """Thin wrapper around checkers.apple.check_pickup_row."""
-    return await apple_checker.check_pickup_row(bot, row)
-
-
-async def run_pickup_check_cycle(bot: Bot) -> dict:
-    """
-    One pickup-availability check pass across every /trackpickup row (all
-    users). A global pause skips the cycle entirely, individually-paused
-    users' rows are excluded.
-    """
-    if is_service_paused():
-        logger.info("[pickup] service globally paused — skipping this check cycle entirely")
-        return {"tracked": 0, "paused": True}
-
-    rows = get_all_pickup_tracking()
-    paused_user_ids = set(list_paused_user_ids())
-    if paused_user_ids:
-        before_count = len(rows)
-        rows = [r for r in rows if r["user_id"] not in paused_user_ids]
-        logger.info(
-            f"[pickup] excluding {before_count - len(rows)} tracked pickup row(s) "
-            f"belonging to {len(paused_user_ids)} individually-paused user(s) this cycle"
-        )
-
-    if not rows:
-        return {"tracked": 0}
-
-    sem = asyncio.Semaphore(10)
-
-    async def _bounded(row):
-        async with sem:
-            await _check_pickup_row(bot, row)
-
-    await asyncio.gather(*[_bounded(row) for row in rows])
-    return {"tracked": len(rows)}
 
 
 # ---------------------------------------------------------------------------
@@ -218,54 +180,108 @@ async def run_apple_official_pickup_cycle(bot: Bot) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# channel_forward_pickup_tracking (admin-curated, forwards to a channel)
-# ---------------------------------------------------------------------------
-
-async def run_channel_forward_pickup_check_cycle(bot: Bot) -> dict:
-    if is_service_paused():
-        logger.info("[channel-forward][pickup] service globally paused — skipping this check cycle entirely")
-        return {"pickup_tracked": 0, "paused": True}
-
-    pickup_rows = list_channel_forward_pickup()
-    sem = asyncio.Semaphore(10)
-
-    async def _check_pickup_row_inner(row: dict) -> None:
-        async with sem:
-            try:
-                await apple_checker.check_channel_pickup_row(bot, row)
-            except Exception as exc:
-                logger.error(f"[channel-forward][pickup] error checking #{row['id']}: {exc}")
-
-    await asyncio.gather(*[_check_pickup_row_inner(row) for row in pickup_rows])
-    return {"pickup_tracked": len(pickup_rows)}
-
-
-# ---------------------------------------------------------------------------
-# Independent Apple pickup-checking loop — covers all three cycles above,
-# on its own APPLE_PICKUP_CHECK_INTERVAL cadence.
+# Official-store loop — UNCHANGED cadence, only run_apple_official_pickup_
+# cycle now (personal/channel-forward pickup checking moved to
+# apple_pickup_stagger_loop below). Kept separate because this cycle hits
+# a completely different Apple endpoint (cookie-based fulfillment-
+# messages via check_pickup_at_official_stores) — no Playwright/
+# playwright_scraper involved, so it was never part of the resource-
+# contention problem the stagger loop below solves, and has no reason to
+# share that loop's per-combo pacing.
 # ---------------------------------------------------------------------------
 
 async def apple_pickup_check_loop(bot: Bot):
     logger.info(
-        f"[apple][pickup] independent check loop started (interval={APPLE_PICKUP_CHECK_INTERVAL}s)"
+        f"[apple][pickup] official-store check loop started (interval={APPLE_PICKUP_CHECK_INTERVAL}s)"
     )
     while True:
-        try:
-            await run_pickup_check_cycle(bot)
-        except Exception as exc:
-            logger.error(f"[apple][pickup] Pickup checker cycle error: {exc}")
-
         try:
             await run_apple_official_pickup_cycle(bot)
         except Exception as exc:
             logger.error(f"[apple][pickup] Apple official-store pickup cycle error: {exc}")
 
-        try:
-            await run_channel_forward_pickup_check_cycle(bot)
-        except Exception as exc:
-            logger.error(f"[apple][pickup] Channel-forward pickup checker cycle error: {exc}")
-
         await asyncio.sleep(APPLE_PICKUP_CHECK_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Staggered one-at-a-time pickup-checking — personal /trackpickup rows
+# AND channel-forward pickup rows, combined into ONE flat list of every
+# (product, pincode) combo, checked ONE at a time with APPLE_PICKUP_
+# STAGGER_INTERVAL_SECONDS between each, cycling forever. Replaces the
+# old run_pickup_check_cycle / run_channel_forward_pickup_check_cycle
+# (each bulk-checked ALL its rows every APPLE_PICKUP_CHECK_INTERVAL, up
+# to 10 rows concurrently via asyncio.Semaphore(10)).
+#
+# Built after real "check failed" results traced to playwright_scraper's
+# own MAX_CONCURRENT_CHECKS=2 browser-slot ceiling (see that module's own
+# history: raised 2->4, hit genuine concurrent-load browser-launch
+# failures, reverted) — bulk-concurrent checking from the bot side could
+# still send more simultaneous Playwright-fallback requests than that
+# ceiling allows, especially with /mypickups and /checkforwarding
+# ALSO able to trigger concurrent checks of their own. checkers.apple's
+# _playwright_fallback_lock (a global lock every page-render caller now
+# shares, /mypickups and /checkforwarding included) guarantees at most
+# ONE Playwright-backed check runs system-wide at any moment; this loop
+# additionally never even TRIES to run more than one check at a time in
+# the first place, trading per-item refresh frequency for eliminating
+# the contention entirely rather than just serializing it.
+#
+# combos are rebuilt FRESH from the DB on every single tick (not once
+# per lap) so: (a) `row` is always current data at the moment it's
+# checked, never stale from earlier in a long lap, and (b) a row
+# added/removed between two ticks is picked up (or drops out) on the
+# very next tick rather than waiting for a full lap to notice.
+# ---------------------------------------------------------------------------
+
+async def _build_pickup_combos() -> list[tuple[str, dict, str]]:
+    """Every current (source, row, pincode) combo across personal
+    pickup_tracking and channel_forward_pickup_tracking — "personal"/
+    "channel" tags which checker function + persist path a combo needs.
+    Empty (not just filtered) while the service is globally paused, same
+    "skip entirely" semantics run_pickup_check_cycle used to have."""
+    if is_service_paused():
+        return []
+
+    combos: list[tuple[str, dict, str]] = []
+    paused_user_ids = set(list_paused_user_ids())
+    for row in get_all_pickup_tracking():
+        if row["user_id"] in paused_user_ids:
+            continue
+        for pincode in row["pincodes"]:
+            combos.append(("personal", row, pincode))
+    for row in list_channel_forward_pickup():
+        for pincode in row.get("pincodes") or []:
+            combos.append(("channel", row, pincode))
+    return combos
+
+
+async def apple_pickup_stagger_loop(bot: Bot):
+    logger.info(
+        f"[apple][pickup][stagger] staggered check loop started "
+        f"(interval={APPLE_PICKUP_STAGGER_INTERVAL_SECONDS}s per combo)"
+    )
+    index = 0
+    while True:
+        combos = await _build_pickup_combos()
+        if not combos:
+            await asyncio.sleep(APPLE_PICKUP_STAGGER_INTERVAL_SECONDS)
+            continue
+
+        index %= len(combos)
+        source, row, pincode = combos[index]
+        try:
+            if source == "personal":
+                await apple_checker.check_pickup_row_pincode(bot, row, pincode)
+            else:
+                await apple_checker.check_channel_pickup_row_pincode(bot, row, pincode)
+        except Exception as exc:
+            logger.error(
+                f"[apple][pickup][stagger] error checking {source} row "
+                f"#{row.get('id')} pincode={pincode!r}: {exc}"
+            )
+
+        index += 1
+        await asyncio.sleep(APPLE_PICKUP_STAGGER_INTERVAL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +455,7 @@ async def main():
 
     apple_cookie_task = asyncio.create_task(apple_cookie_refresh_loop())
     apple_pickup_task = asyncio.create_task(apple_pickup_check_loop(bot))
+    apple_pickup_stagger_task = asyncio.create_task(apple_pickup_stagger_loop(bot))
 
     logger.info("Mangopickup worker starting…")
     try:
@@ -446,6 +463,7 @@ async def main():
     finally:
         apple_cookie_task.cancel()
         apple_pickup_task.cancel()
+        apple_pickup_stagger_task.cancel()
         await bot.session.close()
 
 
