@@ -664,6 +664,30 @@ _PICKUP_MESSAGE_COUNTRY = "in"
 # fraction of the old 240s Playwright-path timeout below.
 _PICKUP_MESSAGE_TIMEOUT = 15.0
 
+# Burst-shaping for the direct (Tier 1) endpoint (2026-07-29): a
+# concurrency cap + a small randomized pre-request jitter. The endpoint
+# was only ever reliability-tested SEQUENTIALLY (/debugpickupmessagestress
+# runs its attempts one at a time with a delay) — never under genuinely
+# CONCURRENT bursts, and simultaneous same-instant hits from one IP are
+# exactly the traffic shape Akamai's bot scoring keys on (the same
+# reasoning behind check_pickup_at_official_stores' sequential-with-jitter
+# pincode pacing and the cookie refresher's randomized retry delays; see
+# both of their own notes). The jitter desynchronizes calls that START
+# together (e.g. one product's pincodes fired side by side by
+# _gather_row_pincode_checks), so they hit Apple staggered by a fraction
+# of a second instead of in the same instant; the semaphore hard-caps
+# how many can be in flight regardless of caller behavior. Only the
+# network call itself is held inside the slot — parsing happens after
+# release. NOTE: this is a preventive control for a SUSPECTED (not
+# confirmed) failure mode — Tier 1 under concurrent load was flagged as
+# the untested remaining suspect after the by-product stagger landed,
+# and this makes the burst question moot rather than waiting to confirm
+# it the hard way.
+_PICKUP_MESSAGE_CONCURRENCY = max(1, int(os.environ.get("APPLE_PICKUP_MESSAGE_CONCURRENCY", "2")))
+_pickup_message_slots = asyncio.Semaphore(_PICKUP_MESSAGE_CONCURRENCY)
+_PICKUP_MESSAGE_JITTER_MIN_SECONDS = float(os.environ.get("APPLE_PICKUP_MESSAGE_JITTER_MIN_SECONDS", "0.1"))
+_PICKUP_MESSAGE_JITTER_MAX_SECONDS = float(os.environ.get("APPLE_PICKUP_MESSAGE_JITTER_MAX_SECONDS", "1.5"))
+
 
 def _parse_pickup_message_response(data: dict, sku: str) -> tuple[bool | None, list[dict], str | None, dict]:
     """
@@ -752,8 +776,14 @@ async def _fetch_pickup_message_direct(sku: str, pincode: str) -> tuple[bool | N
     params = {"parts.0": sku, "location": pincode}
 
     try:
-        async with httpx.AsyncClient(timeout=_PICKUP_MESSAGE_TIMEOUT) as client:
-            resp = await client.get(url, params=params)
+        # Slot + jitter — see _pickup_message_slots' own note above. Held
+        # only for the network round-trip; parsing below runs after release.
+        async with _pickup_message_slots:
+            await asyncio.sleep(random.uniform(
+                _PICKUP_MESSAGE_JITTER_MIN_SECONDS, _PICKUP_MESSAGE_JITTER_MAX_SECONDS
+            ))
+            async with httpx.AsyncClient(timeout=_PICKUP_MESSAGE_TIMEOUT) as client:
+                resp = await client.get(url, params=params)
     except Exception as exc:
         reason = f"request failed: {type(exc).__name__}: {exc}"
         logger.warning(f"[apple][pickup-message-direct] pincode={pincode!r} {reason}")
