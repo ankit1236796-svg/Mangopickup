@@ -3,10 +3,16 @@ apple_admin_handlers.py
 ~~~~~~~~~~~~~~~~~~~~~~~~
 Apple pickup diagnostic/admin commands — extracted from Tracker-alert's
 admin_handlers.py, which also handles plans, approvals, WhatsApp, other
-sites' debug commands, etc. Only the Apple-pickup-related commands are
-here: /debugpickup, /debugpickupraw, /debugpickupflow,
-/debugpickupavailability, /debugpickupmessage, /debugpickupmessagestress,
-/debugpickupstatus, /debugpickupevents, /debugzipcodevalidation.
+sites' debug commands, etc. Commands here: /debugpickup, /debugpickupraw,
+/debugpickupflow, /debugpickupavailability, /debugpickupmessage,
+/debugpickupmessagestress, /debugpickupstatus, /debugpickupevents,
+/debugzipcodevalidation, /addchannelpickup, plus /setchannel — /setchannel
+wasn't explicitly requested, but /addchannelpickup is a no-op without a
+forwarding channel registered first (get_forward_channel() returns None
+until /setchannel has been run), so it's included to make that command
+actually usable. NOT included: /stopforwardingpickup, /listforwarding,
+/setchannelpincode — nice-to-haves for managing channel-forward pickup
+rows, but not required for /addchannelpickup to work.
 
 Router is filtered to ADMIN_USER_ID only, same as the original. Several
 commands additionally hardcode the same admin id — kept as-is from the
@@ -14,10 +20,12 @@ original for parity, harmless since it's this same repo's own admin.
 """
 
 import asyncio
+import html
 import json
 import logging
 import time
 from collections import Counter
+from urllib.parse import urlparse
 
 import httpx
 from aiogram import Router, F
@@ -25,7 +33,7 @@ from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from bs4 import BeautifulSoup
 
-from checkers import fetch_page, apple
+from checkers import fetch_page, apple, detect_site
 from config import ADMIN_USER_ID
 from database import (
     is_site_locked,
@@ -33,6 +41,9 @@ from database import (
     list_channel_forward_pickup,
     get_forwarding_pause_info,
     get_recent_pickup_alert_events,
+    get_forward_channel,
+    set_forward_channel,
+    add_channel_forward_pickup,
 )
 
 logger = logging.getLogger(__name__)
@@ -820,3 +831,145 @@ async def cmd_debugzipcodevalidation(message: Message, command: CommandObject):
             "either nothing availability-related fired, or it fired under a "
             "URL that doesn't contain any of those keywords.",
         )
+
+
+# ---------------------------------------------------------------------------
+# /setchannel — registers the channel that /addchannelpickup forwards to.
+# Not in the original requested command list, but /addchannelpickup can't
+# do anything without it (get_forward_channel() returns None otherwise) —
+# see this file's module docstring.
+# ---------------------------------------------------------------------------
+
+@router.message(Command("setchannel"))
+async def cmd_setchannel(message: Message, command: CommandObject):
+    if not command.args:
+        await message.answer(
+            "Usage: <code>/setchannel &lt;channel_id_or_@username&gt;</code>\n"
+            "The bot must already be an admin in that channel — add it via "
+            "the channel's own Administrators settings first, then run this.",
+            parse_mode="HTML",
+        )
+        return
+
+    identifier = command.args.strip()
+    chat_ref: str | int
+    if identifier.startswith("@"):
+        chat_ref = identifier
+    else:
+        try:
+            chat_ref = int(identifier)
+        except ValueError:
+            await message.answer(
+                "⚠️ Invalid channel identifier — use a numeric chat id (e.g. "
+                "<code>-1001234567890</code>) or <code>@channelusername</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+    try:
+        chat = await message.bot.get_chat(chat_ref)
+    except Exception as exc:
+        await message.answer(
+            f"⚠️ Could not find that chat: {exc}\n"
+            f"Make sure the bot has been added to the channel first (even as "
+            f"a regular member) so it can see it."
+        )
+        return
+
+    try:
+        member = await message.bot.get_chat_member(chat.id, message.bot.id)
+    except Exception as exc:
+        await message.answer(f"⚠️ Could not check the bot's membership in that chat: {exc}")
+        return
+
+    if member.status not in ("administrator", "creator"):
+        await message.answer(
+            f"⚠️ The bot is a member of <b>{html.escape(chat.title or str(chat.id))}</b> "
+            f"but is NOT an admin there (status: {member.status!r}). Add it as an "
+            f"admin via the channel's own Administrators settings, then run "
+            f"/setchannel again.",
+            parse_mode="HTML",
+        )
+        return
+
+    set_forward_channel(chat.id, chat.title, getattr(chat, "username", None))
+    await message.answer(
+        f"✅ Forwarding channel set: <b>{html.escape(chat.title or str(chat.id))}</b> "
+        f"(<code>{chat.id}</code>).\nUse <code>/addchannelpickup &lt;url&gt; &lt;pincodes...&gt;</code> "
+        f"to start forwarding pickup alerts here.",
+        parse_mode="HTML",
+    )
+
+
+def _channel_auto_name(url: str, site: str) -> str:
+    """Last-resort fallback name — same shape as pickup_handlers.py's own
+    _auto_name, kept as a separate tiny copy so this file stays
+    self-contained."""
+    try:
+        path = urlparse(url).path.rstrip("/")
+        slug = path.split("/")[-1][:40] if path else "product"
+    except Exception:
+        slug = "product"
+    return f"{site}: {slug}"
+
+
+@router.message(Command("addchannelpickup"))
+async def cmd_addchannelpickup(message: Message, command: CommandObject):
+    usage = (
+        "Usage: <code>/addchannelpickup &lt;apple_product_url&gt; "
+        "&lt;pincode1&gt; [pincode2] ... [pincode6]</code>"
+    )
+    if not command.args:
+        await message.answer(usage, parse_mode="HTML")
+        return
+
+    parts = command.args.strip().split()
+    if len(parts) < 2:
+        await message.answer(usage, parse_mode="HTML")
+        return
+    url, pincodes = parts[0], parts[1:]
+
+    channel = get_forward_channel()
+    if not channel:
+        await message.answer(
+            "⚠️ No forwarding channel registered yet. Run "
+            "<code>/setchannel &lt;channel_id_or_@username&gt;</code> first.",
+            parse_mode="HTML",
+        )
+        return
+
+    if not url.startswith(("http://", "https://")) or detect_site(url) != "apple":
+        await message.answer("⚠️ /addchannelpickup only supports apple.com product URLs.", parse_mode="HTML")
+        return
+
+    for pincode in pincodes:
+        if not pincode.isdigit() or len(pincode) != 6:
+            await message.answer(f"⚠️ Invalid pincode: <code>{html.escape(pincode)}</code> (must be 6 digits).", parse_mode="HTML")
+            return
+
+    await _debug_send(message, f"🔍 Fetching product page to resolve SKU + name: {url}")
+    try:
+        resp = await fetch_page(url, render_js=apple.NEEDS_JS, timeout=30.0, site="apple")
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+    except Exception as exc:
+        await message.answer(f"⚠️ Could not fetch the product page: {exc}")
+        return
+
+    sku = apple._extract_sku(soup, resp.text)
+    if not sku:
+        await message.answer("⚠️ Could not extract a SKU from this page — cannot track pickup availability.")
+        return
+
+    name = apple._extract_product_name(soup) or _channel_auto_name(url, "apple")
+
+    ok, msg = add_channel_forward_pickup(name, url, pincodes, sku=sku)
+    if ok:
+        await message.answer(
+            f"✅ Now forwarding pickup alerts for <b>{html.escape(name)}</b> at pincodes "
+            f"<code>{html.escape(', '.join(pincodes))}</code> to "
+            f"<b>{html.escape(channel['chat_title'] or str(channel['chat_id']))}</b>.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.answer(f"⚠️ {msg}")

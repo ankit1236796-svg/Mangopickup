@@ -26,6 +26,7 @@ from aiogram.types import BotCommand, BotCommandScopeDefault
 from bs4 import BeautifulSoup
 
 from apple_admin_handlers import router as admin_router
+from pickup_handlers import router as pickup_router
 from config import (
     BOT_TOKEN, APPLE_PICKUP_PINCODES, APPLE_OFFICIAL_PICKUP_ALERTS_ENABLED,
     APPLE_PICKUP_CHECK_INTERVAL, PLAYWRIGHT_SCRAPER_URL, PLAYWRIGHT_SCRAPER_INTERNAL_TOKEN,
@@ -399,6 +400,10 @@ async def apple_cookie_refresh_loop():
 
 async def register_commands(bot: Bot) -> None:
     commands = [
+        BotCommand(command="add", description="Track an apple.com product for official-store pickup checks"),
+        BotCommand(command="trackpickup", description="Track Apple Store pickup availability by pincode"),
+        BotCommand(command="mypickups", description="Check your tracked pickup items right now"),
+        BotCommand(command="untrackpickup", description="Stop tracking a pickup item"),
         BotCommand(command="debugpickup", description="[admin] Raw fulfillment-messages diagnostic"),
         BotCommand(command="debugpickupraw", description="[admin] Replay fulfillment-messages with pasted cookies"),
         BotCommand(command="debugpickupflow", description="[admin] Full pickup-check flow via playwright_scraper"),
@@ -408,6 +413,8 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="debugpickupstatus", description="[admin] Dump persisted pickup_tracking rows"),
         BotCommand(command="debugpickupevents", description="[admin] Dump pickup_alert_log events"),
         BotCommand(command="debugzipcodevalidation", description="[admin] Diagnose pincode-field validation"),
+        BotCommand(command="setchannel", description="[admin] Register the channel for forwarded pickup alerts"),
+        BotCommand(command="addchannelpickup", description="[admin] Forward Apple pickup alerts to the channel"),
     ]
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
     logger.info(f"Registered {len(commands)} bot commands with Telegram")
@@ -421,7 +428,10 @@ async def main():
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher(storage=MemoryStorage())
+    # admin_router first: its handlers are filtered to ADMIN_USER_ID only, so
+    # order relative to pickup_router doesn't affect regular users.
     dp.include_router(admin_router)
+    dp.include_router(pickup_router)
 
     await register_commands(bot)
 
@@ -430,7 +440,7 @@ async def main():
 
     logger.info("Mangopickup worker starting…")
     try:
-        await dp.start_polling(bot, allowed_updates=["message"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         apple_cookie_task.cancel()
         apple_pickup_task.cancel()

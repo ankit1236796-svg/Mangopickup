@@ -13,11 +13,20 @@ with Tracker-alert.
 - `worker.py` — the background loops: `apple_pickup_check_loop` (which runs
   `run_pickup_check_cycle`, `run_apple_official_pickup_cycle`, and
   `run_channel_forward_pickup_check_cycle`) and `apple_cookie_refresh_loop`.
-  Also the process entrypoint — registers `apple_admin_handlers.router` and
-  starts polling.
-- `apple_admin_handlers.py` — the `/debugpickup*`, `/debugzipcodevalidation`,
-  `/debugpickupmessage*`, `/debugpickupstatus`, `/debugpickupevents` admin
-  commands.
+  Also the process entrypoint — registers both routers below and starts
+  polling.
+- `apple_admin_handlers.py` — admin-only commands (router filtered to
+  `ADMIN_USER_ID`): `/debugpickup*`, `/debugzipcodevalidation`,
+  `/debugpickupmessage*`, `/debugpickupstatus`, `/debugpickupevents`,
+  `/addchannelpickup`, and `/setchannel` (added beyond the original request —
+  see the file's own docstring for why).
+- `pickup_handlers.py` — user-facing commands: `/trackpickup`, `/mypickups`,
+  `/untrackpickup` (unchanged from Tracker-alert), and `/add` — a
+  **minimal, apple.com-only** version (see the file's own docstring): just
+  validates the URL and inserts it into `database.products` with
+  `site="apple"`. Tracker-alert's real `/add` also pulls in the whole
+  plan/trial/item-limit system, bulk-add, and an Amazon target-price
+  sub-flow — none of that exists here, by design.
 - `notifications.py` — `send_pickup_alert` / `send_channel_pickup_alert`
   (trimmed from Tracker-alert's notifications.py to just these two).
 - `database.py`, `config.py`, `translations.py`, `zyte_client.py` — copied
@@ -29,20 +38,14 @@ with Tracker-alert.
 - `playwright_scraper/` — the browser-automation service the pickup checker
   and cookie refresher call over HTTP. Deploy as its own Railway service.
 
-## Known gap: nothing here ADDS tracking rows yet
+## Not included
 
-The commands that let a user populate the tables these loops check —
-`/trackpickup` (personal `pickup_tracking` rows), `/add` (the `products`
-table `run_apple_official_pickup_cycle` scans for `site="apple"` rows), and
-`/addchannelpickup` (`channel_forward_pickup_tracking`) — all live in
-Tracker-alert's `handlers.py`/`admin_handlers.py` and were **not** part of
-the requested copy list (only the `/debugpickup*` diagnostic commands were).
-
-As deployed right now, `worker.py`'s loops will run on schedule and simply
-find empty tables — they won't alert on anything until something inserts
-rows into `pickup_tracking`, `products`, or `channel_forward_pickup_tracking`.
-You'll want to either port over `/trackpickup`/`/add`/`/addchannelpickup`
-next, or insert rows some other way, before this is useful end-to-end.
+`/stopforwardingpickup`, `/listforwarding`, `/setchannelpincode` — useful
+for managing/inspecting channel-forward pickup rows once they exist, but
+not required for `/addchannelpickup` itself to work, so left out. `/list`
+and `/remove` for the plain `/add`-tracked apple.com products also aren't
+here — there's currently no way to view or delete a row added via `/add`
+short of direct DB access.
 
 ## Railway services to create
 
