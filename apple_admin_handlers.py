@@ -6,13 +6,20 @@ admin_handlers.py, which also handles plans, approvals, WhatsApp, other
 sites' debug commands, etc. Commands here: /debugpickup, /debugpickupraw,
 /debugpickupflow, /debugpickupavailability, /debugpickupmessage,
 /debugpickupmessagestress, /debugpickupstatus, /debugpickupevents,
-/debugzipcodevalidation, /addchannelpickup, plus /setchannel — /setchannel
-wasn't explicitly requested, but /addchannelpickup is a no-op without a
-forwarding channel registered first (get_forward_channel() returns None
-until /setchannel has been run), so it's included to make that command
-actually usable. NOT included: /stopforwardingpickup, /listforwarding,
-/setchannelpincode — nice-to-haves for managing channel-forward pickup
-rows, but not required for /addchannelpickup to work.
+/debugzipcodevalidation, /addchannelpickup, /stopforwardingpickup,
+/checkforwarding, plus /setchannel — /setchannel wasn't explicitly
+requested, but /addchannelpickup is a no-op without a forwarding channel
+registered first (get_forward_channel() returns None until /setchannel
+has been run), so it's included to make that command actually usable.
+
+/checkforwarding is trimmed from Tracker-alert's original: that version
+also live-checks regular stock channel-forward items
+(channel_forward_tracking, /addchannel, etc.) — that whole feature isn't
+part of this Apple-only repo, so only the pickup-item half is ported.
+
+NOT included: /listforwarding, /setchannelpincode — nice-to-haves for
+managing channel-forward pickup rows, but not required for
+/addchannelpickup or /checkforwarding to work.
 
 Router is filtered to ADMIN_USER_ID only, same as the original. Several
 commands additionally hardcode the same admin id — kept as-is from the
@@ -44,6 +51,9 @@ from database import (
     get_forward_channel,
     set_forward_channel,
     add_channel_forward_pickup,
+    remove_channel_forward_pickup_by_id,
+    remove_channel_forward_pickup_by_url,
+    get_channel_forward_pincodes,
 )
 
 logger = logging.getLogger(__name__)
@@ -973,3 +983,107 @@ async def cmd_addchannelpickup(message: Message, command: CommandObject):
         )
     else:
         await message.answer(f"⚠️ {msg}")
+
+
+# ---------------------------------------------------------------------------
+# /stopforwardingpickup — stop forwarding a channel pickup item, by its
+# /checkforwarding-style index (from the loop below) or by URL substring
+# match. Unchanged from Tracker-alert's original.
+# ---------------------------------------------------------------------------
+
+@router.message(Command("stopforwardingpickup"))
+async def cmd_stopforwardingpickup(message: Message, command: CommandObject):
+    if not command.args:
+        await message.answer("Usage: <code>/stopforwardingpickup &lt;index_or_url&gt;</code>", parse_mode="HTML")
+        return
+
+    arg = command.args.strip()
+    if arg.isdigit():
+        rows = list_channel_forward_pickup()
+        idx = int(arg)
+        if not (1 <= idx <= len(rows)):
+            await message.answer(
+                f"⚠️ No pickup forward entry at index {idx}. Use /checkforwarding "
+                f"to see current entries.",
+            )
+            return
+        target = rows[idx - 1]
+        removed = remove_channel_forward_pickup_by_id(target["id"])
+        if removed:
+            await message.answer(
+                f"✅ Stopped forwarding pickup alerts for <b>{html.escape(target['name'])}</b> "
+                f"(pincodes {html.escape(', '.join(target['pincodes']))}).",
+                parse_mode="HTML",
+            )
+        else:
+            await message.answer("⚠️ Could not remove that entry (already gone?).")
+        return
+
+    count = remove_channel_forward_pickup_by_url(arg)
+    if count:
+        await message.answer(
+            f"✅ Stopped forwarding pickup alerts for {count} entr{'y' if count == 1 else 'ies'} "
+            f"matching that URL.",
+        )
+    else:
+        await message.answer("⚠️ No pickup forward entries match that index or URL.")
+
+
+# ---------------------------------------------------------------------------
+# /checkforwarding — live, on-demand check of every channel-forwarded
+# PICKUP item RIGHT NOW, without waiting for the background cycle. Trimmed
+# from Tracker-alert's original, which also checks regular stock
+# channel-forward items (channel_forward_tracking) — that feature isn't
+# part of this Apple-only repo. Uses the SAME persist/transition/alert
+# logic as the scheduled cycle (checkers.apple.check_channel_pickup_row),
+# so a genuine transition found here fires a real alert, same as
+# /mypickups does for the personal pickup feature.
+# ---------------------------------------------------------------------------
+
+@router.message(Command("checkforwarding"))
+async def cmd_checkforwarding(message: Message):
+    pickup_rows = list_channel_forward_pickup()
+    if not pickup_rows:
+        await message.answer("📭 Nothing is currently set to forward.")
+        return
+
+    configured_pincodes = get_channel_forward_pincodes()
+    if configured_pincodes:
+        pincode_line = f"📍 Configured pincode(s): <code>{html.escape(', '.join(configured_pincodes))}</code>"
+    else:
+        pincode_line = (
+            "⚠️ No pincode configured for pincode-confirmation checks. This repo "
+            "doesn't include /setchannelpincode yet — see the /addchannelpickup "
+            "command's own pincode arguments for per-item pincodes instead."
+        )
+    await message.answer(pincode_line, parse_mode="HTML")
+
+    await message.answer(f"🔍 Checking {len(pickup_rows)} pickup item(s) now…")
+
+    lines: list[str] = []
+    for row in pickup_rows:
+        try:
+            results = await apple.check_channel_pickup_row(message.bot, row)
+        except Exception as exc:
+            lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> (pickup) — check failed: {exc}")
+            continue
+        if not results:
+            lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> (pickup) — check inconclusive")
+            continue
+        pincode_lines = "\n".join(
+            f"  {'✅' if stores else '⬜'} {html.escape(p)}"
+            for p, stores in results.items()
+        )
+        lines.append(f"<b>{html.escape(row['name'])}</b> (pickup)\n{pincode_lines}")
+
+    _CHUNK_SIZE = 3500
+    chunk: list[str] = []
+    chunk_len = 0
+    for line in lines:
+        if chunk_len + len(line) + 1 > _CHUNK_SIZE and chunk:
+            await message.answer("\n".join(chunk), parse_mode="HTML")
+            chunk, chunk_len = [], 0
+        chunk.append(line)
+        chunk_len += len(line) + 1
+    if chunk:
+        await message.answer("\n".join(chunk), parse_mode="HTML")
