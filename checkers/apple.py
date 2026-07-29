@@ -689,6 +689,29 @@ _PICKUP_MESSAGE_JITTER_MIN_SECONDS = float(os.environ.get("APPLE_PICKUP_MESSAGE_
 _PICKUP_MESSAGE_JITTER_MAX_SECONDS = float(os.environ.get("APPLE_PICKUP_MESSAGE_JITTER_MAX_SECONDS", "1.5"))
 
 
+def _pickup_message_proxy_url() -> str | None:
+    """
+    Rotating-residential-proxy URL (Webshare) for the Tier 1 direct
+    fetch ONLY — Tier 2 (playwright_scraper) is a separate service with
+    its own PROXY_* env handling and is deliberately untouched by this.
+    Built from WEBSHARE_PROXY_HOST/PORT/USER/PASS, read at CALL time
+    (mirrors checkers/common.py's SCRAPEDO_KEY pattern) so a Railway env
+    var change takes effect without a restart-ordering concern. Returns
+    None when host/port aren't configured — httpx treats proxy=None as
+    "no proxy", so a deploy without these vars behaves exactly as
+    before (direct connection).
+    """
+    host = os.environ.get("WEBSHARE_PROXY_HOST", "").strip()
+    port = os.environ.get("WEBSHARE_PROXY_PORT", "").strip()
+    if not host or not port:
+        return None
+    user = os.environ.get("WEBSHARE_PROXY_USER", "").strip()
+    password = os.environ.get("WEBSHARE_PROXY_PASS", "").strip()
+    if user and password:
+        return f"http://{user}:{password}@{host}:{port}"
+    return f"http://{host}:{port}"
+
+
 def _parse_pickup_message_response(data: dict, sku: str) -> tuple[bool | None, list[dict], str | None, dict]:
     """
     Parses a /shop/retail/pickup-message response body — confirmed
@@ -778,11 +801,16 @@ async def _fetch_pickup_message_direct(sku: str, pincode: str) -> tuple[bool | N
     try:
         # Slot + jitter — see _pickup_message_slots' own note above. Held
         # only for the network round-trip; parsing below runs after release.
+        # Routed through the Webshare rotating residential proxy when
+        # configured (see _pickup_message_proxy_url) — proxy=None means a
+        # plain direct connection, unchanged from before.
         async with _pickup_message_slots:
             await asyncio.sleep(random.uniform(
                 _PICKUP_MESSAGE_JITTER_MIN_SECONDS, _PICKUP_MESSAGE_JITTER_MAX_SECONDS
             ))
-            async with httpx.AsyncClient(timeout=_PICKUP_MESSAGE_TIMEOUT) as client:
+            async with httpx.AsyncClient(
+                timeout=_PICKUP_MESSAGE_TIMEOUT, proxy=_pickup_message_proxy_url(),
+            ) as client:
                 resp = await client.get(url, params=params)
     except Exception as exc:
         reason = f"request failed: {type(exc).__name__}: {exc}"
