@@ -439,6 +439,7 @@ async def register_commands(bot: Bot) -> None:
         BotCommand(command="addchannelpickup", description="[admin] Forward Apple pickup alerts to the channel"),
         BotCommand(command="stopforwardingpickup", description="[admin] Stop forwarding a pickup item to the channel"),
         BotCommand(command="checkforwarding", description="[admin] Check every forwarded pickup item right now"),
+        BotCommand(command="debugproxyip", description="[admin][temp] Verify Webshare proxy IP rotation"),
     ]
     await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
     logger.info(f"Registered {len(commands)} bot commands with Telegram")

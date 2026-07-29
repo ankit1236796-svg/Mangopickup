@@ -30,6 +30,7 @@ import asyncio
 import html
 import json
 import logging
+import re
 import time
 from collections import Counter
 from urllib.parse import urlparse
@@ -74,6 +75,7 @@ _DEBUG_PICKUP_MESSAGE_STRESS_MAX_ATTEMPTS = 20
 _DEBUG_PICKUP_STATUS_ADMIN_ID = 5004721766
 _DEBUG_PICKUP_EVENTS_ADMIN_ID = 5004721766
 _DEBUG_ZIPCODE_VALIDATION_ADMIN_ID = 5004721766
+_DEBUG_PROXY_IP_ADMIN_ID = 5004721766
 
 
 async def _debug_send(message: Message, text: str) -> None:
@@ -1122,3 +1124,79 @@ async def cmd_checkforwarding(message: Message):
         chunk_len += len(line) + 1
     if chunk:
         await message.answer("\n".join(chunk), parse_mode="HTML")
+
+
+# ---------------------------------------------------------------------------
+# /debugproxyip — TEMPORARY diagnostic for the Webshare rotating-proxy
+# wiring (checkers/apple.py's _pickup_message_proxy_url /
+# _fetch_pickup_message_direct). Verifies the proxy is actually handing
+# out a FRESH exit IP per request rather than httpx keep-alive silently
+# reusing one stale connection/IP across calls — makes 5 SEQUENTIAL GETs
+# to http://ipv4.webshare.io/ (a plain-text IP-echo endpoint), each
+# through its own brand-new httpx.AsyncClient built with the EXACT SAME
+# args _fetch_pickup_message_direct itself uses (same timeout, same
+# proxy=_pickup_message_proxy_url() call — no separate httpx.Limits(...)
+# either, since the real function doesn't set one), so this reflects
+# real Tier 1 behavior rather than a hypothetical client config. Doesn't
+# touch the actual Tier 1 fetch/parse logic at all — purely diagnostic.
+# Safe to delete once the proxy's rotation behavior is confirmed.
+# ---------------------------------------------------------------------------
+
+_DEBUG_PROXY_IP_CHECK_URL = "http://ipv4.webshare.io/"
+_DEBUG_PROXY_IP_ATTEMPTS = 5
+
+
+@router.message(Command("debugproxyip"))
+async def cmd_debugproxyip(message: Message):
+    if message.from_user.id != _DEBUG_PROXY_IP_ADMIN_ID:
+        return
+
+    proxy_url = apple._pickup_message_proxy_url()
+    if not proxy_url:
+        await _debug_send(
+            message,
+            "⚠️ No proxy configured (WEBSHARE_PROXY_HOST/PORT unset) — "
+            "_fetch_pickup_message_direct is making plain direct connections "
+            "right now, nothing to verify rotation for.",
+        )
+        return
+
+    masked = re.sub(r"://[^@]+@", "://***:***@", proxy_url)
+    await _debug_send(
+        message,
+        f"🔍 Making {_DEBUG_PROXY_IP_ATTEMPTS} sequential requests to "
+        f"{_DEBUG_PROXY_IP_CHECK_URL}, each through a brand-new "
+        f"httpx.AsyncClient (same timeout={apple._PICKUP_MESSAGE_TIMEOUT}, "
+        f"same proxy config as the real Tier 1 fetch) — proxy: {masked}",
+    )
+
+    ips: list[str] = []
+    for i in range(1, _DEBUG_PROXY_IP_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(
+                timeout=apple._PICKUP_MESSAGE_TIMEOUT, proxy=proxy_url,
+            ) as client:
+                resp = await client.get(_DEBUG_PROXY_IP_CHECK_URL)
+                resp.raise_for_status()
+                ip = resp.text.strip()
+        except Exception as exc:
+            ip = f"ERROR: {type(exc).__name__}: {exc}"
+
+        logger.info("Proxy Exit IP #%d: %s", i, ip)
+        ips.append(ip)
+        await _debug_send(message, f"#{i}: {ip}")
+
+    successful = [ip for ip in ips if not ip.startswith("ERROR")]
+    unique = set(successful)
+    if len(successful) < 2:
+        verdict = "⚠️ Fewer than 2 successful requests — can't judge rotation."
+    elif len(unique) == len(successful):
+        verdict = f"✅ All {len(successful)} successful requests returned DIFFERENT IPs — rotation looks healthy."
+    elif len(unique) == 1:
+        verdict = f"❌ All {len(successful)} successful requests returned the SAME IP ({unique.pop()}) — no rotation observed."
+    else:
+        verdict = (
+            f"⚠️ {len(unique)} distinct IP(s) across {len(successful)} successful requests — "
+            f"partial/inconsistent rotation."
+        )
+    await _debug_send(message, verdict)
