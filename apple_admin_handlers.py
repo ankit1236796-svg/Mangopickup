@@ -1073,13 +1073,23 @@ async def cmd_checkforwarding(message: Message):
 
     await message.answer(f"🔍 Checking {len(pickup_rows)} pickup item(s) now…")
 
-    lines: list[str] = []
-    for row in pickup_rows:
+    # Checked concurrently (up to 10 at once), matching /mypickups' own
+    # asyncio.gather + Semaphore(10) pattern — previously a plain
+    # sequential loop (one row's checks fully finishing before the next
+    # row even started), which made this command's total wall time the
+    # SUM across every forwarded row instead of the slowest single one,
+    # and let one Playwright-fallback row block every row queued behind
+    # it. Within a single row, pincodes are still checked sequentially by
+    # check_channel_pickup_row itself (avoids a lost-update race on that
+    # row's persisted pincode_status — unchanged, only row-level
+    # concurrency is new here).
+    sem = asyncio.Semaphore(10)
+
+    async def _check_one(row: dict) -> str:
         try:
             results = await apple.check_channel_pickup_row(message.bot, row)
         except Exception as exc:
-            lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> (pickup) — check failed: {exc}")
-            continue
+            return f"⚠️ <b>{html.escape(row['name'])}</b> (pickup) — check failed: {exc}"
 
         # Three-state per pincode (✅ available / ❌ confirmed not available /
         # ⚠️ inconclusive — same convention and same wording as /mypickups'
@@ -1099,7 +1109,13 @@ async def cmd_checkforwarding(message: Message):
             else:
                 pincode_lines.append(t("mypickups_line_unavailable", "en", pincode=pincode))
 
-        lines.append(f"<b>{html.escape(row['name'])}</b> (pickup)\n" + "\n".join(pincode_lines))
+        return f"<b>{html.escape(row['name'])}</b> (pickup)\n" + "\n".join(pincode_lines)
+
+    async def _bounded(row: dict) -> str:
+        async with sem:
+            return await _check_one(row)
+
+    lines: list[str] = list(await asyncio.gather(*[_bounded(row) for row in pickup_rows]))
 
     _CHUNK_SIZE = 3500
     chunk: list[str] = []
