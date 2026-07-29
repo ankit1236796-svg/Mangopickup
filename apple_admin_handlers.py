@@ -21,6 +21,16 @@ NOT included: /listforwarding, /setchannelpincode — nice-to-haves for
 managing channel-forward pickup rows, but not required for
 /addchannelpickup or /checkforwarding to work.
 
+2026-07-29: /addchannelpickup's SKU handling changed — SKU is now a
+required command argument (/addchannelpickup <url> <sku> <pincodes...>),
+never auto-extracted via JSON-LD/regex. check_channel_pickup_row's
+matching dynamic-re-resolution-at-check-time fallback was also removed
+(checkers/apple.py) — SKU now comes ONLY from what's stored on the row.
+/debugpickup, /debugpickupraw still do their OWN live extraction via
+apple._extract_sku — that's unrelated diagnostic behavior (testing
+extraction itself), not the add flow or the live check path, and is
+intentionally untouched.
+
 Router is filtered to ADMIN_USER_ID only, same as the original. Several
 commands additionally hardcode the same admin id — kept as-is from the
 original for parity, harmless since it's this same repo's own admin.
@@ -55,6 +65,8 @@ from database import (
     remove_channel_forward_pickup_by_id,
     remove_channel_forward_pickup_by_url,
     get_channel_forward_pincodes,
+    set_pickup_tracking_sku,
+    set_channel_forward_pickup_sku,
 )
 from translations import t
 
@@ -76,6 +88,7 @@ _DEBUG_PICKUP_STATUS_ADMIN_ID = 5004721766
 _DEBUG_PICKUP_EVENTS_ADMIN_ID = 5004721766
 _DEBUG_ZIPCODE_VALIDATION_ADMIN_ID = 5004721766
 _DEBUG_PROXY_IP_ADMIN_ID = 5004721766
+_DEBUG_BACKFILL_SKU_ADMIN_ID = 5004721766
 
 
 async def _debug_send(message: Message, text: str) -> None:
@@ -908,7 +921,7 @@ async def cmd_setchannel(message: Message, command: CommandObject):
     set_forward_channel(chat.id, chat.title, getattr(chat, "username", None))
     await message.answer(
         f"✅ Forwarding channel set: <b>{html.escape(chat.title or str(chat.id))}</b> "
-        f"(<code>{chat.id}</code>).\nUse <code>/addchannelpickup &lt;url&gt; &lt;pincodes...&gt;</code> "
+        f"(<code>{chat.id}</code>).\nUse <code>/addchannelpickup &lt;url&gt; &lt;sku&gt; &lt;pincodes...&gt;</code> "
         f"to start forwarding pickup alerts here.",
         parse_mode="HTML",
     )
@@ -928,8 +941,10 @@ def _channel_auto_name(url: str, site: str) -> str:
 
 @router.message(Command("addchannelpickup"))
 async def cmd_addchannelpickup(message: Message, command: CommandObject):
+    # 2026-07-29: sku is now a required argument, never auto-extracted via
+    # JSON-LD/regex — see this file's module docstring.
     usage = (
-        "Usage: <code>/addchannelpickup &lt;apple_product_url&gt; "
+        "Usage: <code>/addchannelpickup &lt;apple_product_url&gt; &lt;sku&gt; "
         "&lt;pincode1&gt; [pincode2] ... [pincode6]</code>"
     )
     if not command.args:
@@ -937,10 +952,10 @@ async def cmd_addchannelpickup(message: Message, command: CommandObject):
         return
 
     parts = command.args.strip().split()
-    if len(parts) < 2:
+    if len(parts) < 3:
         await message.answer(usage, parse_mode="HTML")
         return
-    url, pincodes = parts[0], parts[1:]
+    url, sku, pincodes = parts[0], parts[1], parts[2:]
 
     channel = get_forward_channel()
     if not channel:
@@ -960,26 +975,23 @@ async def cmd_addchannelpickup(message: Message, command: CommandObject):
             await message.answer(f"⚠️ Invalid pincode: <code>{html.escape(pincode)}</code> (must be 6 digits).", parse_mode="HTML")
             return
 
-    await _debug_send(message, f"🔍 Fetching product page to resolve SKU + name: {url}")
+    # Page fetch is now ONLY a best-effort attempt at a nicer display name —
+    # never blocks adding, and never touches SKU (sku came from the admin
+    # above).
     try:
         resp = await fetch_page(url, render_js=apple.NEEDS_JS, timeout=30.0, site="apple")
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
+        name = apple._extract_product_name(soup) or _channel_auto_name(url, "apple")
     except Exception as exc:
-        await message.answer(f"⚠️ Could not fetch the product page: {exc}")
-        return
-
-    sku = apple._extract_sku(soup, resp.text)
-    if not sku:
-        await message.answer("⚠️ Could not extract a SKU from this page — cannot track pickup availability.")
-        return
-
-    name = apple._extract_product_name(soup) or _channel_auto_name(url, "apple")
+        logger.warning(f"[addchannelpickup] product page fetch failed for {url!r} (name resolution only): {exc}")
+        name = _channel_auto_name(url, "apple")
 
     ok, msg = add_channel_forward_pickup(name, url, pincodes, sku=sku)
     if ok:
         await message.answer(
-            f"✅ Now forwarding pickup alerts for <b>{html.escape(name)}</b> at pincodes "
+            f"✅ Now forwarding pickup alerts for <b>{html.escape(name)}</b> "
+            f"(SKU <code>{html.escape(sku)}</code>) at pincodes "
             f"<code>{html.escape(', '.join(pincodes))}</code> to "
             f"<b>{html.escape(channel['chat_title'] or str(channel['chat_id']))}</b>.",
             parse_mode="HTML",
@@ -1200,3 +1212,110 @@ async def cmd_debugproxyip(message: Message):
             f"partial/inconsistent rotation."
         )
     await _debug_send(message, verdict)
+
+
+# ---------------------------------------------------------------------------
+# /debugbackfillsku — TEMPORARY one-off migration for the 2026-07-29 SKU
+# change (see cmd_trackpickup/cmd_addchannelpickup's own comments and
+# checkers.apple.check_channel_pickup_row's docstring): SKU is now a
+# required, manually-supplied value everywhere, and dynamic re-extraction
+# was removed from the live check path. Any row added BEFORE this change
+# whose stored SKU doesn't match its actual color variant needs backfilling
+# once, by hand, against confirmed-correct SKUs — that's what this does.
+#
+# Matches each row's color KEYWORD against its own name+url text
+# (case-insensitive substring) and only WRITES when exactly one color
+# matches — a row matching zero or more than one color is left untouched
+# and called out explicitly, never guessed at. Reports every row it
+# looked at (matched-and-updated, matched-already-correct, ambiguous, or
+# no-match) so nothing happens silently. Safe to delete once you've
+# confirmed all 5 rows are correctly backfilled.
+# ---------------------------------------------------------------------------
+
+_BACKFILL_SKU_BY_COLOR = {
+    "black": "MG6J4HN/A",
+    "white": "MG6K4HN/A",
+    "mist blue": "MG6L4HN/A",
+    "lavender": "MG6M4HN/A",
+    "sage": "MG6N4HN/A",
+}
+
+
+def _backfill_match_color(row: dict) -> list[str]:
+    haystack = f"{row.get('name', '')} {row.get('url', '')}".lower()
+    return [color for color in _BACKFILL_SKU_BY_COLOR if color in haystack]
+
+
+@router.message(Command("debugbackfillsku"))
+async def cmd_debugbackfillsku(message: Message):
+    if message.from_user.id != _DEBUG_BACKFILL_SKU_ADMIN_ID:
+        return
+
+    lines: list[str] = [
+        f"🔍 Backfilling SKUs against {len(_BACKFILL_SKU_BY_COLOR)} confirmed "
+        f"color->SKU mapping(s), matched by keyword in each row's name/url:",
+    ]
+
+    for color, sku in _BACKFILL_SKU_BY_COLOR.items():
+        lines.append(f"  {color} → <code>{html.escape(sku)}</code>")
+    await _debug_send(message, "\n".join(lines))
+
+    updated = 0
+    already_correct = 0
+    ambiguous = 0
+    no_match = 0
+
+    for row in get_all_pickup_tracking():
+        matches = _backfill_match_color(row)
+        label = f"[personal] #{row['id']} {row.get('name', '')!r}"
+        if len(matches) == 1:
+            sku = _BACKFILL_SKU_BY_COLOR[matches[0]]
+            old_sku = row.get("sku")
+            if old_sku == sku:
+                already_correct += 1
+                await _debug_send(message, f"{label}: already {sku!r} ({matches[0]}) — no change.")
+            else:
+                set_pickup_tracking_sku(row["id"], sku)
+                updated += 1
+                await _debug_send(
+                    message, f"{label}: {old_sku!r} → {sku!r} ({matches[0]})",
+                )
+        elif len(matches) == 0:
+            no_match += 1
+            await _debug_send(message, f"{label}: no color keyword matched — SKIPPED (current sku: {row.get('sku')!r}).")
+        else:
+            ambiguous += 1
+            await _debug_send(message, f"{label}: AMBIGUOUS, matched {matches} — SKIPPED, fix manually.")
+
+    for row in list_channel_forward_pickup():
+        matches = _backfill_match_color(row)
+        label = f"[channel] #{row['id']} {row.get('name', '')!r}"
+        if len(matches) == 1:
+            sku = _BACKFILL_SKU_BY_COLOR[matches[0]]
+            old_sku = row.get("sku")
+            if old_sku == sku:
+                already_correct += 1
+                await _debug_send(message, f"{label}: already {sku!r} ({matches[0]}) — no change.")
+            else:
+                set_channel_forward_pickup_sku(row["id"], sku)
+                updated += 1
+                await _debug_send(
+                    message, f"{label}: {old_sku!r} → {sku!r} ({matches[0]})",
+                )
+        elif len(matches) == 0:
+            no_match += 1
+            await _debug_send(message, f"{label}: no color keyword matched — SKIPPED (current sku: {row.get('sku')!r}).")
+        else:
+            ambiguous += 1
+            await _debug_send(message, f"{label}: AMBIGUOUS, matched {matches} — SKIPPED, fix manually.")
+
+    await _debug_send(
+        message,
+        f"Done. updated={updated} already_correct={already_correct} "
+        f"ambiguous={ambiguous} no_match={no_match}."
+        + (
+            "\n⚠️ ambiguous/no_match rows were left untouched — set their SKU "
+            "manually (no live command for it; use a one-off DB update)."
+            if ambiguous or no_match else ""
+        ),
+    )

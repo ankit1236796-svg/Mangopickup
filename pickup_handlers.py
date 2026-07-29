@@ -5,15 +5,24 @@ User-facing Apple pickup commands — extracted from Tracker-alert's
 handlers.py, which also handles every other site's /add flow, the
 plan/trial/item-limit system, bulk-add, etc. Only what's needed here:
 
-- /trackpickup, /mypickups, /untrackpickup — unchanged from Tracker-alert
-  (these were already Apple-only and self-contained; no plan/limit checks).
+- /trackpickup, /mypickups, /untrackpickup — mostly unchanged from
+  Tracker-alert (these were already Apple-only and self-contained; no
+  plan/limit checks). /trackpickup's SKU handling IS changed: 2026-07-29,
+  SKU is now a required command argument
+  (/trackpickup <url> <sku> <pincodes...>), never auto-extracted via
+  JSON-LD/regex — see cmd_trackpickup's own comments. The product page is
+  still fetched, but ONLY as a best-effort attempt at a nicer display
+  name; a fetch failure no longer blocks adding.
 - /add — a MINIMAL, apple.com-only version. Tracker-alert's real /add is a
   multi-step FSM flow tied into access.py's plan/trial/item-limit system,
   supports bulk-add, and has an Amazon-specific target-price sub-flow —
   none of which exists in this repo. This version just validates the URL
   is an apple.com product, resolves a name, and inserts it into
   database.products with site="apple" — the only thing
-  worker.run_apple_official_pickup_cycle actually needs.
+  worker.run_apple_official_pickup_cycle actually needs. Not affected by
+  the SKU change above — this table has no SKU column; SKU resolution
+  for the official-store cycle is a separate, untouched mechanism (see
+  worker.py's _check_apple_official_pickup_group).
 """
 
 import html
@@ -114,11 +123,13 @@ async def cmd_trackpickup(message: Message, command: CommandObject):
             return
 
         parts = command.args.strip().split()
-        if len(parts) < 2:
+        if len(parts) < 3:
             await message.answer(t("trackpickup_usage", lang), parse_mode="HTML")
             return
 
-        url, pincodes = parts[0], parts[1:]
+        # 2026-07-29: SKU is now a required argument, never auto-extracted —
+        # see module docstring. url, sku, then one or more pincodes.
+        url, sku, pincodes = parts[0], parts[1], parts[2:]
 
         if not url.startswith(("http://", "https://")) or detect_site(url) != "apple":
             await message.answer(t("trackpickup_invalid_url", lang), parse_mode="HTML")
@@ -137,22 +148,16 @@ async def cmd_trackpickup(message: Message, command: CommandObject):
                 )
                 return
 
+        # Page fetch is now ONLY a best-effort attempt at a nicer display
+        # name — never blocks adding, and never touches SKU (see above).
         try:
             resp = await fetch_page(url, render_js=apple_checker.NEEDS_JS, timeout=30.0)
             resp.raise_for_status()
-            html_text = resp.text
+            soup = BeautifulSoup(resp.text, "html.parser")
+            name = apple_checker._extract_product_name(soup) or _auto_name(url, "apple")
         except Exception as exc:
-            logger.error(f"[trackpickup] product page fetch failed for {url!r}: {exc}")
-            await message.answer(t("trackpickup_sku_failed", lang), parse_mode="HTML")
-            return
-
-        soup = BeautifulSoup(html_text, "html.parser")
-        sku = apple_checker._extract_sku(soup, html_text)
-        if not sku:
-            await message.answer(t("trackpickup_sku_failed", lang), parse_mode="HTML")
-            return
-
-        name = apple_checker._extract_product_name(soup) or _auto_name(url, "apple")
+            logger.warning(f"[trackpickup] product page fetch failed for {url!r} (name resolution only): {exc}")
+            name = _auto_name(url, "apple")
 
         ok, msg = add_pickup_tracking(user_id, name, url, sku, pincodes)
         if ok:

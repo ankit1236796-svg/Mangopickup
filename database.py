@@ -993,6 +993,22 @@ def update_channel_forward_pickup_status(row_id: int, pincode_status: dict, sku:
         conn.commit()
 
 
+def set_channel_forward_pickup_sku(row_id: int, sku: str) -> None:
+    """
+    SKU-only counterpart to update_channel_forward_pickup_status, for a
+    fix/migration that just needs to correct/backfill a row's SKU (2026-
+    07-29, /debugbackfillsku) without also replaying its current
+    pincode_status/last_checked — avoids a read-then-write race against
+    whatever the stagger loop might be persisting concurrently.
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE channel_forward_pickup_tracking SET sku = ? WHERE id = ?",
+            (sku, row_id),
+        )
+        conn.commit()
+
+
 def list_products(user_id: int) -> list[dict]:
     with get_connection() as conn:
         rows = conn.execute(
@@ -1585,6 +1601,25 @@ def update_pickup_status(tracking_id: int, pincode_status: dict) -> None:
         conn.execute(
             "UPDATE pickup_tracking SET pincode_status = ? WHERE id = ?",
             (json.dumps(pincode_status), tracking_id),
+        )
+        conn.commit()
+
+
+def set_pickup_tracking_sku(tracking_id: int, sku: str) -> None:
+    """
+    Overwrites the stored SKU for one pickup_tracking row (2026-07-29,
+    added for /debugbackfillsku — see apple_admin_handlers.py). Previously
+    SKU was only ever written once, at add_pickup_tracking's INSERT time;
+    this exists because SKU is now a required, manually-supplied value
+    (dynamic re-extraction was removed from the live check path), so a fix
+    or migration needs a way to correct/backfill a row's SKU after the
+    fact without re-adding it (which would also require re-entering every
+    pincode and losing the row's existing pincode_status history).
+    """
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE pickup_tracking SET sku = ? WHERE id = ?",
+            (sku, tracking_id),
         )
         conn.commit()
 

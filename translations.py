@@ -1303,38 +1303,38 @@ _T: dict[str, dict[str, str]] = {
     # ── Apple Store pickup-availability tracking (/trackpickup) ───────────────
     "trackpickup_usage": {
         "en": ("📍 <b>Track Apple Store pickup availability</b>\n\n"
-               "Usage: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+               "Usage: <code>/trackpickup &lt;apple_url&gt; &lt;sku&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
                "Send the product page URL followed by one or more 6-digit pincodes. "
                "You'll get a notification the moment pickup becomes available at any "
                "nearby store for any of them."),
         "hi": ("📍 <b>Apple Store pickup availability track करें</b>\n\n"
-               "इस्तेमाल करें: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+               "इस्तेमाल करें: <code>/trackpickup &lt;apple_url&gt; &lt;sku&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
                "Product page का URL भेजें, उसके बाद एक या ज़्यादा 6-digit pincode। "
                "जैसे ही किसी भी pincode के पास किसी store पर pickup available होगा, "
                "आपको notification मिल जाएगा।"),
         "hinglish": ("📍 <b>Apple Store pickup availability track karo</b>\n\n"
-                     "Usage: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+                     "Usage: <code>/trackpickup &lt;apple_url&gt; &lt;sku&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
                      "Product page ka URL bhejo, uske baad ek ya zyada 6-digit pincode. "
                      "Jaise hi kisi bhi pincode ke paas kisi store pe pickup available "
                      "hoga, notification mil jaayega."),
         "punjabi": ("📍 <b>Apple Store pickup availability track karo ji</b>\n\n"
-                    "Usage: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+                    "Usage: <code>/trackpickup &lt;apple_url&gt; &lt;sku&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
                     "Product page da URL bhejo, uske baad ek ja zyada 6-digit pincode. "
                     "Jiven hi kise vi pincode de nede kise store te pickup available "
                     "hoyega, notification aa jaayega!"),
         "haryanvi": ("📍 <b>Apple Store pickup availability track कर</b>\n\n"
-                     "इस्तेमाल कर: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+                     "इस्तेमाल कर: <code>/trackpickup &lt;apple_url&gt; &lt;sku&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
                      "Product page का URL भेज, उसकै बाद एक या ज्यादा 6-digit pincode। "
                      "ज्यूं ए कोए भी pincode कै धोरै किसे store पै pickup available "
                      "होज्या, तन्नै notification मिलज्यागी।"),
         "tamil": ("📍 <b>Apple Store pickup availability track செய்யுங்கள்</b>\n\n"
-                  "பயன்பாடு: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+                  "பயன்பாடு: <code>/trackpickup &lt;apple_url&gt; &lt;sku&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
                   "Product page-இன் URL-ஐ அனுப்பவும், அதன் பின் ஒன்று அல்லது அதற்கு "
                   "மேற்பட்ட 6-digit pincode-களை அனுப்பவும். எந்த pincode அருகிலும் "
                   "எந்த store-லும் pickup available ஆன உடனேயே உங்களுக்கு notification "
                   "வரும்."),
         "gujarati": ("📍 <b>Apple Store pickup availability track કરો</b>\n\n"
-                     "ઉપયોગ: <code>/trackpickup &lt;apple_url&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
+                     "ઉપયોગ: <code>/trackpickup &lt;apple_url&gt; &lt;sku&gt; &lt;pincode1&gt; &lt;pincode2&gt; ...</code>\n\n"
                      "Product page નું URL મોકલો, પછી એક અથવા વધુ 6-digit pincode. "
                      "જેવું કોઈપણ pincode ની નજીક કોઈ store પર pickup available થાય, "
                      "તમને તરત notification મળી જશે."),

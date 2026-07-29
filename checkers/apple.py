@@ -1504,12 +1504,13 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
     bot.py imports admin_handlers.router), but both already import
     checkers.apple.
 
-    SKU is fetched fresh from the product page if not already cached on
-    the row (mirrors bot.py's own _check_apple_official_pickup_group) —
-    channel_forward_pickup_tracking rows are created via /addchannelpickup
-    with the SKU already resolved at add-time, so this is normally a
-    no-op fetch-skip; only relevant if that initial extraction somehow
-    didn't get persisted.
+    2026-07-29: dynamic SKU re-resolution at check time REMOVED — SKU is
+    now a required argument at /addchannelpickup add-time (manually
+    supplied, never auto-extracted via JSON-LD/regex) and comes ONLY
+    from what's stored on the row. A row with no stored SKU (shouldn't
+    happen under the current add flow, but could for a row untouched by
+    that migration) is skipped outright rather than falling back to a
+    live page fetch — see the `if not sku` branch below.
 
     Pincodes are fetched concurrently (capped at config.APPLE_PICKUP_
     PINCODE_CONCURRENCY) then applied sequentially with one batched
@@ -1531,10 +1532,7 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
     2026-07-28: WIRED to _fetch_pickup_availability_via_page_render, same
     change and same reasoning as check_pickup_row above — see that
     function's own docstring for the full detail (0%-success direct httpx
-    path replaced, None/False semantics, etc.). `sku` is still resolved
-    here (unlike check_pickup_row, which drops SKU lookup entirely) only
-    because update_channel_forward_pickup_status persists it separately;
-    it's no longer passed into the availability check itself.
+    path replaced, None/False semantics, etc.).
     """
     # Deferred imports — see check_pickup_row's own note above for why.
     from database import (
@@ -1545,23 +1543,13 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
 
     sku = row.get("sku")
     if not sku:
-        try:
-            resp = await fetch_page(row["url"], render_js=NEEDS_JS, timeout=30.0, site="apple")
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            sku = _extract_sku(soup, resp.text)
-        except Exception as exc:
-            logger.error(
-                f"[apple][channel-pickup] product page fetch/SKU extraction "
-                f"failed for #{row['id']} url={row['url']!r}: {exc}"
-            )
-            return {}
-        if not sku:
-            logger.warning(
-                f"[apple][channel-pickup] could not extract a SKU for "
-                f"#{row['id']} url={row['url']!r} — skipping this cycle"
-            )
-            return {}
+        logger.error(
+            f"[apple][channel-pickup] #{row['id']} url={row['url']!r} has no "
+            f"stored SKU — dynamic re-resolution was removed (SKU is required "
+            f"at /addchannelpickup add-time now); skipping this cycle."
+        )
+        log_pickup_alert_event("channel", row["id"], None, "missing_sku", row["url"])
+        return {}
 
     fetched = await _gather_row_pincode_checks(
         row["url"], row.get("pincodes") or [], sku,
