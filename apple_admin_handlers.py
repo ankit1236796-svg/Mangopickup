@@ -55,6 +55,7 @@ from database import (
     remove_channel_forward_pickup_by_url,
     get_channel_forward_pincodes,
 )
+from translations import t
 
 logger = logging.getLogger(__name__)
 
@@ -1040,6 +1041,18 @@ async def cmd_stopforwardingpickup(message: Message, command: CommandObject):
 # /mypickups does for the personal pickup feature.
 # ---------------------------------------------------------------------------
 
+def _format_store_list(stores: list[dict]) -> str:
+    """Same shape as pickup_handlers.py's own _format_store_list — kept as
+    a separate tiny copy rather than importing across files, matching this
+    file's existing self-containment convention (see _channel_auto_name)."""
+    parts = []
+    for s in stores:
+        name = html.escape(s.get("store_name") or "(unnamed store)")
+        location = s.get("location")
+        parts.append(f"{name} ({html.escape(location)})" if location else name)
+    return ", ".join(parts)
+
+
 @router.message(Command("checkforwarding"))
 async def cmd_checkforwarding(message: Message):
     pickup_rows = list_channel_forward_pickup()
@@ -1067,14 +1080,26 @@ async def cmd_checkforwarding(message: Message):
         except Exception as exc:
             lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> (pickup) — check failed: {exc}")
             continue
-        if not results:
-            lines.append(f"⚠️ <b>{html.escape(row['name'])}</b> (pickup) — check inconclusive")
-            continue
-        pincode_lines = "\n".join(
-            f"  {'✅' if stores else '⬜'} {html.escape(p)}"
-            for p, stores in results.items()
-        )
-        lines.append(f"<b>{html.escape(row['name'])}</b> (pickup)\n{pincode_lines}")
+
+        # Three-state per pincode (✅ available / ❌ confirmed not available /
+        # ⚠️ inconclusive — same convention and same wording as /mypickups'
+        # own _format_mypickups_results, via the same translation keys)
+        # instead of the old ✅/⬜ scheme, which collapsed "checked, not
+        # available" and "no data yet" into the same ambiguous-looking box.
+        pincode_lines = []
+        for pincode in row.get("pincodes") or []:
+            if pincode not in results:
+                pincode_lines.append(t("mypickups_line_check_failed", "en", pincode=pincode))
+                continue
+            stores = results[pincode]
+            if stores:
+                pincode_lines.append(
+                    t("mypickups_line_available", "en", pincode=pincode, stores=_format_store_list(stores))
+                )
+            else:
+                pincode_lines.append(t("mypickups_line_unavailable", "en", pincode=pincode))
+
+        lines.append(f"<b>{html.escape(row['name'])}</b> (pickup)\n" + "\n".join(pincode_lines))
 
     _CHUNK_SIZE = 3500
     chunk: list[str] = []
