@@ -300,17 +300,29 @@ APPLE_PICKUP_CHECK_INTERVAL = int(os.getenv("APPLE_PICKUP_CHECK_INTERVAL", "180"
 # producing more "check failed" results under load than with fewer items
 # tracked (the same resource-contention pattern documented in playwright_
 # scraper/main.py's own MAX_CONCURRENT_CHECKS history: raised 2->4, hit
-# real browser-launch failures under concurrent load, reverted). Rather
-# than bulk-checking everything every cycle, worker.apple_pickup_stagger_
-# loop now cycles through every (product, pincode) combo ONE AT A TIME —
-# combined with checkers.apple's _playwright_fallback_lock (a global,
-# cross-caller lock ensuring at most one Playwright-backed check ever
-# runs system-wide, which /mypickups and /checkforwarding also respect),
-# this trades per-item refresh frequency for eliminating concurrent
-# browser-launch contention entirely. This is the delay BETWEEN each
-# individual combo's check — total time to cycle back to the same combo
-# is roughly (this value) x (total tracked combo count).
+# real browser-launch failures under concurrent load, reverted).
+#
+# worker.apple_pickup_stagger_loop therefore staggers checking BY PRODUCT
+# (2026-07-29; briefly per-(product, pincode) combo earlier the same day):
+# each tick checks ONE product row — all of that row's pincodes together,
+# concurrently, capped at APPLE_PICKUP_PINCODE_CONCURRENCY below — then
+# sleeps this interval before the next product. At any given moment at
+# most one product (i.e. at most APPLE_PICKUP_PINCODE_CONCURRENCY
+# simultaneous pincode-checks) is ever running, with real gaps between
+# different products' checks. Each product's effective refresh interval
+# is therefore roughly (this value) x (number of tracked product rows,
+# personal + channel-forward combined) — e.g. 5 products at the 60s
+# default = each product refreshes ~every 5 minutes.
 APPLE_PICKUP_STAGGER_INTERVAL_SECONDS = int(os.getenv("APPLE_PICKUP_STAGGER_INTERVAL_SECONDS", "60"))
+# How many of ONE product's pincodes may be checked simultaneously during
+# its tick (and during /mypickups' / /checkforwarding's per-row checks).
+# 2 matches playwright_scraper's own MAX_CONCURRENT_CHECKS=2 browser-slot
+# ceiling, so even a worst case where every pincode of the row falls back
+# to Playwright can't oversubscribe that service. checkers/apple.py's
+# _playwright_fallback_slots semaphore (same default, own env var) is the
+# backstop that enforces the Playwright-side cap globally across ALL
+# callers regardless of this per-row setting.
+APPLE_PICKUP_PINCODE_CONCURRENCY = int(os.getenv("APPLE_PICKUP_PINCODE_CONCURRENCY", "2"))
 
 # Croma's own dedicated check interval — same "isolate one site onto its own
 # cadence" pattern as APPLE_PICKUP_CHECK_INTERVAL above (a next_croma_run

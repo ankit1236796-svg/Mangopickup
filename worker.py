@@ -7,9 +7,10 @@ forwarding, etc. Loops here: apple_pickup_check_loop (now ONLY
 run_apple_official_pickup_cycle, on its own cadence — a separate,
 cookie-based Apple endpoint, not playwright_scraper), apple_pickup_
 stagger_loop (personal /trackpickup + channel-forward pickup rows, one
-(product, pincode) combo at a time — see that loop's own docstring for
-why this replaced the old bulk-concurrent run_pickup_check_cycle /
-run_channel_forward_pickup_check_cycle), and apple_cookie_refresh_loop.
+PRODUCT at a time with its pincodes checked concurrently — see that
+loop's own module note for why this replaced the old bulk-concurrent
+run_pickup_check_cycle / run_channel_forward_pickup_check_cycle), and
+apple_cookie_refresh_loop.
 
 Also registers apple_admin_handlers.router so the /debugpickup* diagnostic
 commands work — this is a fully independent bot/token/DB, so there's no
@@ -204,80 +205,85 @@ async def apple_pickup_check_loop(bot: Bot):
 
 
 # ---------------------------------------------------------------------------
-# Staggered one-at-a-time pickup-checking — personal /trackpickup rows
-# AND channel-forward pickup rows, combined into ONE flat list of every
-# (product, pincode) combo, checked ONE at a time with APPLE_PICKUP_
-# STAGGER_INTERVAL_SECONDS between each, cycling forever. Replaces the
-# old run_pickup_check_cycle / run_channel_forward_pickup_check_cycle
-# (each bulk-checked ALL its rows every APPLE_PICKUP_CHECK_INTERVAL, up
-# to 10 rows concurrently via asyncio.Semaphore(10)).
+# Staggered BY-PRODUCT pickup-checking — personal /trackpickup rows AND
+# channel-forward pickup rows, combined into one round-robin list of
+# product ROWS. Each tick checks ONE product: all of that product's
+# pincodes together, concurrently (capped at config.APPLE_PICKUP_
+# PINCODE_CONCURRENCY inside check_pickup_row / check_channel_pickup_row
+# — see checkers.apple._gather_row_pincode_checks), then sleeps
+# APPLE_PICKUP_STAGGER_INTERVAL_SECONDS before the next product, cycling
+# forever. So at any moment at most ONE product — i.e. at most
+# APPLE_PICKUP_PINCODE_CONCURRENCY simultaneous pincode-checks — is ever
+# running, with real gaps between different products' checks. Each
+# product's effective refresh interval ≈ interval × (total product rows,
+# personal + channel combined): e.g. 5 products at the 60s default =
+# each product refreshes ~every 5 minutes.
 #
-# Built after real "check failed" results traced to playwright_scraper's
-# own MAX_CONCURRENT_CHECKS=2 browser-slot ceiling (see that module's own
-# history: raised 2->4, hit genuine concurrent-load browser-launch
-# failures, reverted) — bulk-concurrent checking from the bot side could
-# still send more simultaneous Playwright-fallback requests than that
-# ceiling allows, especially with /mypickups and /checkforwarding
-# ALSO able to trigger concurrent checks of their own. checkers.apple's
-# _playwright_fallback_lock (a global lock every page-render caller now
-# shares, /mypickups and /checkforwarding included) guarantees at most
-# ONE Playwright-backed check runs system-wide at any moment; this loop
-# additionally never even TRIES to run more than one check at a time in
-# the first place, trading per-item refresh frequency for eliminating
-# the contention entirely rather than just serializing it.
+# History: originally bulk-concurrent (run_pickup_check_cycle /
+# run_channel_forward_pickup_check_cycle, up to 10 rows at once via
+# asyncio.Semaphore(10)) — produced ~40-60% "check failed" results under
+# multi-item load, traced to playwright_scraper's own MAX_CONCURRENT_
+# CHECKS=2 browser-slot ceiling (see that module's own history: raised
+# 2->4, hit genuine concurrent-load browser-launch failures, reverted).
+# Briefly a strict one-(product,pincode)-combo-per-tick schedule
+# (2026-07-29, same day) before landing on this by-product grouping: a
+# product's own pincodes are checked together so its status is a
+# coherent snapshot, and 2 concurrent checks were never the source of
+# overload — 10 were. checkers.apple's _playwright_fallback_slots
+# semaphore (capacity-matched to playwright_scraper, shared by
+# /mypickups and /checkforwarding too) remains the global backstop.
 #
-# combos are rebuilt FRESH from the DB on every single tick (not once
-# per lap) so: (a) `row` is always current data at the moment it's
-# checked, never stale from earlier in a long lap, and (b) a row
-# added/removed between two ticks is picked up (or drops out) on the
-# very next tick rather than waiting for a full lap to notice.
+# Rows are rebuilt FRESH from the DB on every single tick (not once per
+# lap) so: (a) `row` is always current data at the moment it's checked,
+# never stale from earlier in a long lap, and (b) a row added/removed
+# between two ticks is picked up (or drops out) on the very next tick
+# rather than waiting for a full lap to notice.
 # ---------------------------------------------------------------------------
 
-async def _build_pickup_combos() -> list[tuple[str, dict, str]]:
-    """Every current (source, row, pincode) combo across personal
+async def _build_pickup_check_rows() -> list[tuple[str, dict]]:
+    """Every current (source, row) product row across personal
     pickup_tracking and channel_forward_pickup_tracking — "personal"/
-    "channel" tags which checker function + persist path a combo needs.
+    "channel" tags which checker function + persist path a row needs.
     Empty (not just filtered) while the service is globally paused, same
     "skip entirely" semantics run_pickup_check_cycle used to have."""
     if is_service_paused():
         return []
 
-    combos: list[tuple[str, dict, str]] = []
+    rows: list[tuple[str, dict]] = []
     paused_user_ids = set(list_paused_user_ids())
     for row in get_all_pickup_tracking():
         if row["user_id"] in paused_user_ids:
             continue
-        for pincode in row["pincodes"]:
-            combos.append(("personal", row, pincode))
+        if row["pincodes"]:
+            rows.append(("personal", row))
     for row in list_channel_forward_pickup():
-        for pincode in row.get("pincodes") or []:
-            combos.append(("channel", row, pincode))
-    return combos
+        if row.get("pincodes"):
+            rows.append(("channel", row))
+    return rows
 
 
 async def apple_pickup_stagger_loop(bot: Bot):
     logger.info(
         f"[apple][pickup][stagger] staggered check loop started "
-        f"(interval={APPLE_PICKUP_STAGGER_INTERVAL_SECONDS}s per combo)"
+        f"(interval={APPLE_PICKUP_STAGGER_INTERVAL_SECONDS}s per product)"
     )
     index = 0
     while True:
-        combos = await _build_pickup_combos()
-        if not combos:
+        rows = await _build_pickup_check_rows()
+        if not rows:
             await asyncio.sleep(APPLE_PICKUP_STAGGER_INTERVAL_SECONDS)
             continue
 
-        index %= len(combos)
-        source, row, pincode = combos[index]
+        index %= len(rows)
+        source, row = rows[index]
         try:
             if source == "personal":
-                await apple_checker.check_pickup_row_pincode(bot, row, pincode)
+                await apple_checker.check_pickup_row(bot, row)
             else:
-                await apple_checker.check_channel_pickup_row_pincode(bot, row, pincode)
+                await apple_checker.check_channel_pickup_row(bot, row)
         except Exception as exc:
             logger.error(
-                f"[apple][pickup][stagger] error checking {source} row "
-                f"#{row.get('id')} pincode={pincode!r}: {exc}"
+                f"[apple][pickup][stagger] error checking {source} row #{row.get('id')}: {exc}"
             )
 
         index += 1
