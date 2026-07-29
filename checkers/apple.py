@@ -857,23 +857,28 @@ _page_render_cache: dict[str, dict] = {}
 _page_render_locks: dict[str, asyncio.Lock] = {}
 _page_render_locks_guard = asyncio.Lock()
 
-# Global, cross-(url,pincode) lock around the Playwright-fallback call
-# ONLY (not direct_http, which has no shared-resource concern and doesn't
-# touch playwright_scraper at all) — added after real "check failed"
-# results were traced to playwright_scraper's own MAX_CONCURRENT_CHECKS=2
-# browser-slot ceiling (see that module's own history: raised 2->4,
-# caused genuine "BrowserType.launch: Target page, context or browser
-# has been closed" failures under concurrent load, reverted). The
-# per-key lock above (_page_render_locks) only dedups repeat calls for
-# the SAME (url, pincode); it does nothing to stop N DIFFERENT combos
-# from launching N different browsers at once. This lock guarantees at
-# most ONE Playwright-backed check is ever in flight system-wide —
-# across the stagger loop, /mypickups, and /checkforwarding alike,
-# regardless of how many rows or pincodes any one caller thinks it's
-# checking concurrently — trading some throughput for eliminating that
-# resource contention entirely, more conservative than even
-# playwright_scraper's own 2-slot ceiling.
-_playwright_fallback_lock = asyncio.Lock()
+# Global, cross-(url,pincode) concurrency cap around the Playwright-
+# fallback call ONLY (not direct_http, which has no shared-resource
+# concern and doesn't touch playwright_scraper at all) — added after real
+# "check failed" results were traced to playwright_scraper's own
+# MAX_CONCURRENT_CHECKS=2 browser-slot ceiling (see that module's own
+# history: raised 2->4, caused genuine "BrowserType.launch: Target page,
+# context or browser has been closed" failures under concurrent load,
+# reverted). The per-key lock above (_page_render_locks) only dedups
+# repeat calls for the SAME (url, pincode); it does nothing to stop N
+# DIFFERENT combos from launching N different browsers at once. This
+# semaphore caps system-wide in-flight Playwright-backed checks — across
+# the stagger loop, /mypickups, and /checkforwarding alike, regardless of
+# how many pincodes any one caller checks concurrently — at exactly the
+# capacity playwright_scraper itself can serve (its MAX_CONCURRENT_
+# CHECKS=2 default; keep the two settings in step if either changes),
+# so a burst of fallbacks queues here instead of failing there.
+# (Briefly a strict Lock of 1 when first added, before the checking
+# schedule moved to one-product-at-a-time with its pincodes concurrent —
+# a product's own 2 pincodes are allowed to fall back side by side.)
+_playwright_fallback_slots = asyncio.Semaphore(
+    int(os.environ.get("APPLE_PLAYWRIGHT_FALLBACK_CONCURRENCY", "2"))
+)
 
 
 def _page_render_cache_key(product_url: str, pincode: str) -> str:
@@ -1098,11 +1103,12 @@ async def _fetch_pickup_availability_via_page_render(
             meta["direct_http_error"] = direct_http_error
             return None, [], reason, meta
 
-        # Only ONE Playwright-backed check runs system-wide at a time — see
-        # _playwright_fallback_lock's own module-level comment for why.
-        # Everything above this point (cache lookup, direct_http attempt)
-        # is unaffected and can still run fully concurrently.
-        async with _playwright_fallback_lock:
+        # System-wide Playwright-backed checks are capped at playwright_
+        # scraper's own serving capacity — see _playwright_fallback_slots'
+        # module-level comment for why. Everything above this point (cache
+        # lookup, direct_http attempt) is unaffected and can still run
+        # fully concurrently.
+        async with _playwright_fallback_slots:
             try:
                 async with httpx.AsyncClient(timeout=240.0) as client:
                     resp = await client.post(
@@ -1253,6 +1259,50 @@ def available_stores_for_pickup(data: dict, sku: str) -> list[dict]:
     return available
 
 
+async def _gather_row_pincode_checks(
+    product_url: str, pincodes: list[str], sku: str | None,
+    log_tag: str, row_id, source: str,
+) -> list[tuple[str, bool | None, list[dict]]]:
+    """
+    Fetch phase shared by check_pickup_row / check_channel_pickup_row:
+    runs _fetch_pickup_availability_via_page_render for every pincode of
+    ONE row concurrently, capped at config.APPLE_PICKUP_PINCODE_
+    CONCURRENCY (default 2 — matching playwright_scraper's own
+    MAX_CONCURRENT_CHECKS browser-slot capacity, so even an all-pincodes-
+    fall-back-to-Playwright worst case can't oversubscribe it; checkers.
+    apple's _playwright_fallback_slots semaphore is the global backstop
+    either way). Pure fetch — no status writes, no alerts — so the
+    callers' single-writer read-modify-write of pincode_status stays
+    race-free while the fetches themselves overlap.
+
+    Returns [(pincode, available, stores)] in the SAME order as
+    `pincodes`; a pincode whose fetch raised is reported as
+    (pincode, None, []) — indistinguishable from an ordinary
+    inconclusive result on purpose, since both mean "leave prior status
+    untouched" to every caller.
+    """
+    from config import APPLE_PICKUP_PINCODE_CONCURRENCY
+    from database import log_pickup_alert_event
+
+    sem = asyncio.Semaphore(max(1, APPLE_PICKUP_PINCODE_CONCURRENCY))
+
+    async def _one(pincode: str) -> tuple[str, bool | None, list[dict]]:
+        async with sem:
+            try:
+                available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(
+                    product_url, pincode, sku=sku,
+                )
+            except Exception as exc:
+                logger.error(
+                    f"{log_tag} error checking #{row_id} pincode={pincode!r}: {exc}"
+                )
+                log_pickup_alert_event(source, row_id, pincode, "fetch_error", str(exc))
+                return pincode, None, []
+            return pincode, available, stores
+
+    return list(await asyncio.gather(*[_one(p) for p in pincodes]))
+
+
 async def check_pickup_row(bot, row: dict) -> dict:
     """
     Checks every saved pincode for one database.pickup_tracking row RIGHT
@@ -1268,13 +1318,19 @@ async def check_pickup_row(bot, row: dict) -> dict:
     can't import bot.py directly (bot.py imports handlers.router, so that
     would be circular), but both already import checkers.apple.
 
-    Sequential across pincodes WITHIN this row (never concurrent) so
-    pincode_status can be safely read-modified-written once at the end
-    without a lost-update race between two pincodes of the SAME row
-    finishing at different times. Callers may still run different ROWS
-    concurrently (see run_pickup_check_cycle's semaphore-gated gather) —
-    this only serializes within a row, matching the low pincode-per-row
-    counts the feature expects (a handful of pincodes at most).
+    A row's pincodes are FETCHED concurrently (capped at config.
+    APPLE_PICKUP_PINCODE_CONCURRENCY, default 2 — matching playwright_
+    scraper's own browser-slot capacity) via _gather_row_pincode_checks,
+    then the results are APPLIED sequentially in one pass with a single
+    read-modify-write of pincode_status at the end. This was previously
+    fully sequential per pincode specifically to avoid a lost-update
+    race on that status dict; splitting fetch (parallel, no shared
+    state) from apply (sequential, single writer) keeps the same safety
+    with concurrent fetches. Callers are expected to run ROWS
+    sequentially (worker.apple_pickup_stagger_loop checks one product
+    per tick; /mypickups and /checkforwarding iterate rows in a plain
+    loop), so this per-row cap is also the system-wide check
+    concurrency.
 
     Returns {pincode: [store dicts]} for every pincode actually checked
     this call — used by /mypickups to show the caller a live per-pincode
@@ -1324,20 +1380,15 @@ async def check_pickup_row(bot, row: dict) -> dict:
     from database import update_pickup_status, log_pickup_alert_event
     from notifications import send_pickup_alert
 
+    fetched = await _gather_row_pincode_checks(
+        row["url"], row["pincodes"], row.get("sku"),
+        "[apple][pickup]", row["id"], "personal",
+    )
+
     status = dict(row["pincode_status"])
     changed = False
     results: dict[str, list[dict]] = {}
-    for pincode in row["pincodes"]:
-        try:
-            available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(
-                row["url"], pincode, sku=row.get("sku"),
-            )
-        except Exception as exc:
-            logger.error(
-                f"[apple][pickup] error checking tracking #{row['id']} pincode={pincode!r}: {exc}"
-            )
-            log_pickup_alert_event("personal", row["id"], pincode, "fetch_error", str(exc))
-            continue
+    for pincode, available, stores in fetched:
         if available is None:
             continue  # inconclusive this call — leave prior status untouched
 
@@ -1380,78 +1431,6 @@ async def check_pickup_row(bot, row: dict) -> dict:
     return results
 
 
-async def check_pickup_row_pincode(bot, row: dict, pincode: str) -> list[dict] | None:
-    """
-    Single-(row, pincode) counterpart to check_pickup_row above — built
-    for worker.apple_pickup_stagger_loop's one-combo-at-a-time schedule
-    (replaces the old bulk-concurrent run_pickup_check_cycle; see that
-    loop's own module note for the full "why"). check_pickup_row checks
-    every pincode of a row back-to-back in ONE call, batching its
-    read-modify-write of pincode_status at the end; this checks exactly
-    ONE pincode, since staggering means a row's OTHER pincodes may not be
-    checked again for many combos' worth of time — batching wouldn't
-    make sense here. `row` is expected FRESH (the caller rebuilds its
-    combo list right before each check — see _build_pickup_combos), so
-    row["pincode_status"] is trusted directly rather than re-fetched.
-
-    Same transition/alert/persist semantics as check_pickup_row, just
-    scoped to one pincode: persists only `if changed` (same convention),
-    sends a pickup alert on a genuine unavailable->available transition.
-    Returns the matching stores list (possibly empty) on a definitive
-    result, or None if this check was inconclusive/failed — same
-    "absent/None = inconclusive, leave prior status untouched" contract
-    check_pickup_row's own per-pincode handling uses.
-    """
-    from database import update_pickup_status, log_pickup_alert_event
-    from notifications import send_pickup_alert
-
-    try:
-        available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(
-            row["url"], pincode, sku=row.get("sku"),
-        )
-    except Exception as exc:
-        logger.error(
-            f"[apple][pickup][stagger] error checking tracking #{row['id']} pincode={pincode!r}: {exc}"
-        )
-        log_pickup_alert_event("personal", row["id"], pincode, "fetch_error", str(exc))
-        return None
-    if available is None:
-        return None  # inconclusive this call — leave prior status untouched
-
-    status = dict(row["pincode_status"])
-    was_available = bool(status.get(pincode, False))
-
-    if available != was_available:
-        status[pincode] = available
-        try:
-            update_pickup_status(row["id"], status)
-        except Exception as exc:
-            logger.error(
-                f"[apple][pickup][stagger] error persisting pincode_status for tracking #{row['id']}: {exc}"
-            )
-            log_pickup_alert_event("personal", row["id"], None, "status_persist_error", str(exc))
-
-    if available and not was_available:
-        log_pickup_alert_event(
-            "personal", row["id"], pincode, "transition_true",
-            f"sku={row.get('sku')!r} url={row['url']!r} stores={[s.get('store_name') for s in stores]}",
-        )
-        try:
-            send_status = await send_pickup_alert(bot, row["user_id"], row["name"], pincode, stores)
-        except Exception as exc:
-            logger.error(
-                f"[apple][pickup][stagger] error sending alert for tracking #{row['id']} pincode={pincode!r}: {exc}"
-            )
-            log_pickup_alert_event("personal", row["id"], pincode, "alert_send_exception", str(exc))
-        else:
-            event = "alert_sent" if send_status == "sent" else (
-                "alert_suppressed_locked" if send_status == "suppressed_locked" else "alert_send_error"
-            )
-            log_pickup_alert_event("personal", row["id"], pincode, event, send_status)
-
-    return stores
-
-
 async def check_channel_pickup_row(bot, row: dict) -> dict:
     """
     Channel-forwarding sibling of check_pickup_row above — same
@@ -1474,9 +1453,10 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
     no-op fetch-skip; only relevant if that initial extraction somehow
     didn't get persisted.
 
-    Sequential across pincodes WITHIN this row, same reasoning as
-    check_pickup_row's own docstring (avoids a lost-update race on this
-    row's single persisted pincode_status dict).
+    Pincodes are fetched concurrently (capped at config.APPLE_PICKUP_
+    PINCODE_CONCURRENCY) then applied sequentially with one batched
+    pincode_status write — same _gather_row_pincode_checks split and
+    same reasoning as check_pickup_row's own docstring.
 
     Returns {pincode: [store dicts]} for every pincode actually checked
     this call — used by /checkforwarding to show a live per-pincode
@@ -1525,20 +1505,15 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
             )
             return {}
 
+    fetched = await _gather_row_pincode_checks(
+        row["url"], row.get("pincodes") or [], sku,
+        "[apple][channel-pickup]", row["id"], "channel",
+    )
+
     status = dict(row.get("pincode_status") or {})
     results: dict[str, list[dict]] = {}
     channel = None
-    for pincode in row.get("pincodes") or []:
-        try:
-            available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(
-                row["url"], pincode, sku=sku,
-            )
-        except Exception as exc:
-            logger.error(
-                f"[apple][channel-pickup] error checking #{row['id']} pincode={pincode!r}: {exc}"
-            )
-            log_pickup_alert_event("channel", row["id"], pincode, "fetch_error", str(exc))
-            continue
+    for pincode, available, stores in fetched:
         if available is None:
             continue  # inconclusive this call — leave prior status untouched
 
@@ -1591,106 +1566,6 @@ async def check_channel_pickup_row(bot, row: dict) -> dict:
         log_pickup_alert_event("channel", row["id"], None, "status_persist_error", str(exc))
 
     return results
-
-
-async def check_channel_pickup_row_pincode(bot, row: dict, pincode: str) -> list[dict] | None:
-    """
-    Single-(row, pincode) counterpart to check_channel_pickup_row above —
-    same reasoning as check_pickup_row_pincode (built for worker.
-    apple_pickup_stagger_loop's one-combo-at-a-time schedule, replacing
-    the old bulk-concurrent run_channel_forward_pickup_check_cycle).
-
-    Persists unconditionally after every check (matching
-    check_channel_pickup_row's own convention, not just `if changed`) so
-    last_checked stays accurate even without a transition. SKU is
-    resolved fresh from the product page if missing on `row`, same as
-    check_channel_pickup_row — normally a no-op since /addchannelpickup
-    resolves and caches it at add-time.
-    """
-    from database import (
-        update_channel_forward_pickup_status, is_forwarding_paused, get_forward_channel,
-        log_pickup_alert_event,
-    )
-    from notifications import send_channel_pickup_alert
-
-    sku = row.get("sku")
-    if not sku:
-        try:
-            resp = await fetch_page(row["url"], render_js=NEEDS_JS, timeout=30.0, site="apple")
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            sku = _extract_sku(soup, resp.text)
-        except Exception as exc:
-            logger.error(
-                f"[apple][channel-pickup][stagger] product page fetch/SKU extraction "
-                f"failed for #{row['id']} url={row['url']!r}: {exc}"
-            )
-            return None
-        if not sku:
-            logger.warning(
-                f"[apple][channel-pickup][stagger] could not extract a SKU for "
-                f"#{row['id']} url={row['url']!r} — skipping"
-            )
-            return None
-
-    try:
-        available, stores, _error, _meta = await _fetch_pickup_availability_via_page_render(
-            row["url"], pincode, sku=sku,
-        )
-    except Exception as exc:
-        logger.error(
-            f"[apple][channel-pickup][stagger] error checking #{row['id']} pincode={pincode!r}: {exc}"
-        )
-        log_pickup_alert_event("channel", row["id"], pincode, "fetch_error", str(exc))
-        return None
-    if available is None:
-        return None  # inconclusive this call — leave prior status untouched
-
-    status = dict(row.get("pincode_status") or {})
-    was_available = bool(status.get(pincode, False))
-    status[pincode] = available
-
-    try:
-        update_channel_forward_pickup_status(row["id"], status, sku=sku)
-    except Exception as exc:
-        logger.error(
-            f"[apple][channel-pickup][stagger] error persisting pincode_status for #{row['id']}: {exc}"
-        )
-        log_pickup_alert_event("channel", row["id"], None, "status_persist_error", str(exc))
-
-    if available and not was_available:
-        log_pickup_alert_event(
-            "channel", row["id"], pincode, "transition_true",
-            f"sku={sku!r} url={row['url']!r} stores={[s.get('store_name') for s in stores]}",
-        )
-        if is_forwarding_paused():
-            logger.info(
-                f"[apple][channel-pickup][stagger] #{row['id']} pincode={pincode!r} "
-                f"transitioned to available but forwarding is paused — alert suppressed."
-            )
-            log_pickup_alert_event("channel", row["id"], pincode, "alert_suppressed_paused")
-        else:
-            channel = get_forward_channel() or {}
-            if not channel:
-                logger.warning(
-                    f"[apple][channel-pickup][stagger] #{row['id']} pincode={pincode!r} "
-                    f"transitioned to available but no channel is registered — alert skipped."
-                )
-                log_pickup_alert_event("channel", row["id"], pincode, "alert_no_channel_registered")
-            else:
-                try:
-                    send_status = await send_channel_pickup_alert(bot, channel["chat_id"], row["name"], pincode, stores)
-                except Exception as exc:
-                    logger.error(
-                        f"[apple][channel-pickup][stagger] alert failed for #{row['id']} "
-                        f"pincode={pincode!r}: {exc}"
-                    )
-                    log_pickup_alert_event("channel", row["id"], pincode, "alert_send_exception", str(exc))
-                else:
-                    event = "alert_sent" if send_status == "sent" else "alert_send_error"
-                    log_pickup_alert_event("channel", row["id"], pincode, event, send_status)
-
-    return stores
 
 
 async def refine_with_pincode(

@@ -218,15 +218,15 @@ async def cmd_mypickups(message: Message):
             t("mypickups_checking", lang, count=len(rows)), parse_mode="HTML"
         )
 
-        # Sequential, not concurrent (2026-07-29) — concurrent row checks
-        # here could exceed playwright_scraper's own MAX_CONCURRENT_
-        # CHECKS=2 browser-slot ceiling, producing more "check failed"
-        # results under load than with fewer items tracked. checkers.
-        # apple's _playwright_fallback_lock (shared with the background
-        # stagger loop) already guarantees at most one Playwright-backed
-        # check runs system-wide at a time; going sequential here too
-        # avoids piling up requests behind that lock for no benefit,
-        # since this command's own rows would just serialize on it anyway.
+        # Rows sequential, not concurrent (2026-07-29) — matches the
+        # background stagger loop's one-product-at-a-time model. Within
+        # each row, check_pickup_row itself checks the row's pincodes
+        # concurrently, capped at config.APPLE_PICKUP_PINCODE_CONCURRENCY
+        # (default 2, matching playwright_scraper's own MAX_CONCURRENT_
+        # CHECKS=2 browser-slot ceiling), so at most one product's worth
+        # of checks is in flight from this command at any moment.
+        # checkers.apple's _playwright_fallback_slots semaphore is the
+        # global backstop on Playwright-side concurrency either way.
         rows_with_results: list[tuple[dict, dict]] = []
         for row in rows:
             try:
